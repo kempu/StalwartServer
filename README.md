@@ -30,21 +30,20 @@ that reindex.
 ## Building
 
 `upstream.lock` pins everything: the upstream tag and commit, the build and runtime images by
-digest, the features, the release name. `scripts/ci-prepare.sh` runs the publish gate, clones
-that commit, refuses it if it is not the pinned one, applies `patches/` in order and copies the
-`Dockerfile` into the patched tree, which is the build context:
+digest, the features, the release name. `scripts/build-image.sh` is the whole build. It runs
+`scripts/ci-prepare.sh`, which runs the publish gate, clones that commit, refuses it if it is not
+the pinned one, applies `patches/` in order and copies the `Dockerfile` into the patched tree
+(the build context). Then it runs one `docker buildx build` whose every argument comes from
+`upstream.lock`, and refuses the image unless the server binary inside it is x86-64:
 
 ```sh
-bash scripts/ci-prepare.sh
-. ./upstream.lock
-docker build -f src/Dockerfile.stalwartserver \
-  --build-arg CHEF_IMAGE="$CHEF_IMAGE" --build-arg RUNTIME_IMAGE="$RUNTIME_IMAGE" \
-  --build-arg CARGO_FEATURES="$CARGO_FEATURES" --build-arg BUILD_JOBS="$BUILD_JOBS" \
-  --build-arg SOURCE_URL=https://github.com/kempu/StalwartServer \
-  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" --build-arg RELEASE="$RELEASE" \
-  --build-arg SEARCH_INDEX_FORMAT="$SEARCH_INDEX_FORMAT" \
-  -t stalwart-server:"$RELEASE" src
+bash scripts/build-image.sh                  # stalwart-server:<RELEASE>, in local docker
+bash scripts/build-image.sh --push IMAGE     # IMAGE:<RELEASE> pushed, and its digest printed
 ```
+
+The image is linux/amd64 whatever the host: the compile stages run on the build platform and
+cross-compile to x86_64, so an arm64 machine compiles natively and emulates only the runtime
+stage's few `RUN` steps.
 
 The Dockerfile is upstream's own, with three differences:
 
@@ -52,9 +51,17 @@ The Dockerfile is upstream's own, with three differences:
 - **Only `CARGO_FEATURES` is compiled** (`postgres s3`), and **not `enterprise`**: that code is
   under the Stalwart Enterprise License, not the AGPL this build is published under. Without a
   licence key the upstream image runs that code switched off, so for a deployment without one the
-  behaviour is the same.
-- **Thin LTO, 16 codegen units and a bounded job count**, instead of fat LTO with one unit, so
-  the build fits a 4 GB runner.
+  behaviour is the same. The one difference visible from outside is `/api/account` reporting the
+  edition as `oss` rather than `community`.
+- **Thin LTO and 16 codegen units**, instead of fat LTO with one unit, which needs several times
+  the memory and time.
+
+**Memory.** Measured on v0.16.21-kempu.1: the build peaks at about 4.1 GB, and nearly all of it
+is the last step, linking the server with thin LTO across every crate, which needs about 4 GB
+whatever `BUILD_JOBS` is. Under a 3.8 GB cap that link is killed with SIGKILL at the end of the
+build, and so it is inside any BuildKit daemon with a fixed memory limit below that. The largest
+single crate, `registry` (about 87,000 lines of generated code), peaks at 1.45 GB. Give the
+builder 6 GB.
 
 The image carries `/usr/share/doc/stalwart/SOURCE`, naming this repository and the exact
 revision it was built from.
