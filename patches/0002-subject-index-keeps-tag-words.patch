@@ -1,0 +1,123 @@
+From 4918a5406bd3d9d4e9032b674ad8533f6c7b7489 Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 15:05:44 +0300
+Subject: [PATCH 2/2] email search: index the words of a leading subject tag
+
+The Subject field was indexed as thread_name(subject), which removes
+reply prefixes and leading [tags]. "[Ticket ID: 4711] Payment link" was
+indexed as "Payment link", so neither a subject nor a free-text search
+found "ticket", and a word that exists only in the tag (a mailing list's
+or a ticket system's name) could not be found at all.
+
+Index the thread name followed by whatever thread_name removed. The
+thread name stays first because the same value is the subject sort
+key, so sorting by subject is unchanged.
+---
+ crates/email/src/message/index/search.rs | 76 +++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/crates/email/src/message/index/search.rs b/crates/email/src/message/index/search.rs
+index a7ed9ae..851ec29 100644
+--- a/crates/email/src/message/index/search.rs
++++ b/crates/email/src/message/index/search.rs
+@@ -20,6 +20,7 @@ use nlp::{
+     },
+     tokenizers::word::WordTokenizer,
+ };
++use std::borrow::Cow;
+ use store::{
+     ahash::AHashSet,
+     backend::MAX_TOKEN_LENGTH,
+@@ -138,6 +139,7 @@ impl ArchivedMessageMetadata {
+                                     .contains(&SearchField::Email(EmailSearchField::Subject)))
+                                 && let Some(subject) = header.value.as_text()
+                             {
++                                let indexed = subject_index_text(subject);
+                                 let subject = thread_name(subject);
+ 
+                                 if part_language.is_unknown() {
+@@ -146,7 +148,7 @@ impl ArchivedMessageMetadata {
+ 
+                                 document.index_text(
+                                     SearchField::Email(EmailSearchField::Subject),
+-                                    subject,
++                                    &indexed,
+                                     part_language,
+                                 );
+                             }
+@@ -342,3 +344,75 @@ impl ArchivedMessageMetadata {
+         document
+     }
+ }
++
++/// What the Subject field is indexed as: the thread name first, then whatever `thread_name`
++/// cut away around it.
++///
++/// Indexing the thread name alone made every word of a leading `[tag]` unsearchable:
++/// `[Ticket ID: 4711] Payment link` was indexed as `Payment link`, so neither a subject nor a
++/// free-text search found "ticket", and a word that exists only in the tag (a list's or a
++/// ticket system's name) was found by nothing. The thread name still comes FIRST because the
++/// same value is the subject sort key, which has to keep ordering replies and tagged mail by
++/// what they are about.
++fn subject_index_text(subject: &str) -> Cow<'_, str> {
++    let thread = thread_name(subject);
++    if thread.is_empty() || thread.len() == subject.len() {
++        return Cow::Borrowed(subject);
++    }
++    match subject.find(thread) {
++        Some(start) => {
++            let removed = format!("{} {}", &subject[..start], &subject[start + thread.len()..]);
++            match removed.trim() {
++                "" => Cow::Borrowed(thread),
++                removed => Cow::Owned(format!("{thread} {removed}")),
++            }
++        }
++        // Not a plain slice of the subject: keep the whole subject after the thread name,
++        // so no word of it goes unindexed.
++        None => Cow::Owned(format!("{thread} {subject}")),
++    }
++}
++
++#[cfg(test)]
++mod subject_index_text_tests {
++    use super::subject_index_text;
++
++    #[test]
++    fn a_leading_tag_is_indexed_after_the_thread_name() {
++        assert_eq!(
++            subject_index_text("[Ticket ID: 4711] Payment link"),
++            "Payment link [Ticket ID: 4711]"
++        );
++        assert_eq!(
++            subject_index_text("Re: [Acme-Support] Password reset"),
++            "Password reset Re: [Acme-Support]"
++        );
++    }
++
++    #[test]
++    fn a_plain_subject_is_indexed_unchanged() {
++        assert_eq!(subject_index_text("Quarterly invoice"), "Quarterly invoice");
++        assert_eq!(subject_index_text(""), "");
++    }
++
++    #[test]
++    fn every_word_of_the_subject_is_indexed() {
++        for subject in [
++            "Fwd: Re: Budget",
++            "[Fwd: Offsite agenda]",
++            "[list] [Ticket 9]",
++            "AW: [Team] Meeting notes (fwd)",
++        ] {
++            let indexed = subject_index_text(subject);
++            for word in subject
++                .split(|c: char| !c.is_alphanumeric())
++                .filter(|w| !w.is_empty())
++            {
++                assert!(
++                    indexed.contains(word),
++                    "{subject:?} -> {indexed:?} lost {word:?}"
++                );
++            }
++        }
++    }
++}

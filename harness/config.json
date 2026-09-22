@@ -1,0 +1,10 @@
+{
+  "@type": "PostgreSql",
+  "host": "postgres",
+  "port": 5432,
+  "database": "stalwart",
+  "authUsername": "stalwart",
+  "authSecret": { "@type": "EnvironmentVariable", "variableName": "HARNESS_PG_PASSWORD" },
+  "useTls": false,
+  "poolMaxConnections": 10
+}
