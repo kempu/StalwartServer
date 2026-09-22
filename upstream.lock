@@ -1,0 +1,32 @@
+# The exact upstream this repository builds on. scripts/ci-prepare.sh reads every value and
+# the Dockerfile has no defaults, so a build can never drift to another version.
+#
+# Update to an upstream release that has been out for at least 14 days, and change the tag
+# and the commit together: ci-prepare.sh refuses a checkout whose commit is not this one.
+# RELEASE names the image; bump its last number whenever patches/ changes.
+
+STALWART_REPO="https://github.com/stalwartlabs/stalwart.git"
+STALWART_TAG="v0.16.21"
+STALWART_COMMIT="e96200385781a6a9995a8b839ac27d6c75a983ee"
+RELEASE="v0.16.21-kempu.1"
+
+# What the search index holds. Bump it whenever a patch (or an upstream update) changes what is
+# written to the index, and never otherwise: it is baked into the image as the label
+# io.github.kempu.stalwart-server.search-index-format, and a deployment compares that label with
+# the format its database was last reindexed to, and reindexes when they differ. "1" is patches
+# 0001 and 0002 over v0.16.21.
+SEARCH_INDEX_FORMAT="1"
+
+# Upstream's own image of that release, which the harness measures as the stock baseline.
+UPSTREAM_IMAGE="docker.io/stalwartlabs/stalwart:v0.16.21@sha256:93c574e52249c1ebf90061da2c4c0756a7b72abfcc1fec34506a03c2e38b5977"
+
+# Build and runtime images, pinned by digest. Upstream's own Dockerfile floats on :latest.
+CHEF_IMAGE="docker.io/lukemathwalker/cargo-chef:0.1.78-rust-1.97.1-slim-trixie@sha256:c7569b097797bc1f3d86a8b6f8a056dc336d05c6f57dd81eb0486948f986dccd"
+RUNTIME_IMAGE="docker.io/library/debian:trixie-20260824-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
+
+# Only the backends this build is run with. No `enterprise`: that code is licensed under the
+# Stalwart Enterprise License, not the AGPL this repository is published under.
+CARGO_FEATURES="postgres s3"
+
+# Parallel rustc jobs. Bounded so the build fits a 4 GB runner; see README.md ("Building").
+BUILD_JOBS="2"

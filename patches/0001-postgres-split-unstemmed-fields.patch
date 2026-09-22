@@ -1,0 +1,113 @@
+From b3e56a416ca5090fba9cbfdb0caaf2692b36365f Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 15:05:44 +0300
+Subject: [PATCH 1/2] postgres search: split fields indexed without a language
+ on punctuation
+
+On a PostgreSQL data store, a field indexed without a language (the
+From/To/Cc/Bcc addresses, a calendar organizer, attendee or location)
+goes through to_tsvector('simple', ...), and Postgres's parser keeps an
+e-mail address, a host name and a hyphenated word as ONE token. Such a
+field could only be found by its whole value: a search for a sender's
+domain, a subdomain or a hyphenated domain matched nothing, where the
+internal search engine (SpaceTokenizer) finds all of them.
+
+Split those fields on every run of characters that are not letters or
+digits, with regexp_replace, when indexing and when querying, so they
+carry the tokens the internal engine gives them. The query also keeps
+the value exactly as Postgres tokenises it, ORed with the split form,
+so rows indexed before this change still match as they did and nothing
+is lost while a reindex runs.
+---
+ crates/store/src/backend/postgres/search.rs | 63 ++++++++++++++++++---
+ 1 file changed, 55 insertions(+), 8 deletions(-)
+
+diff --git a/crates/store/src/backend/postgres/search.rs b/crates/store/src/backend/postgres/search.rs
+index ca083e4..430727d 100644
+--- a/crates/store/src/backend/postgres/search.rs
++++ b/crates/store/src/backend/postgres/search.rs
+@@ -67,14 +67,24 @@ impl PostgresStore {
+ 
+                 if let Some(value) = fields.get(field) {
+                     let value_ref = format!("${}", values.len() + 1);
+-                    let (text_len, language) = if let SearchValue::Text { value, language } = value
+-                    {
+-                        (value.len(), self.ts_config(language))
+-                    } else {
+-                        (0, PG_UNSTEMMED_LANG)
+-                    };
++                    let (text_len, language, unstemmed) =
++                        if let SearchValue::Text { value, language } = value {
++                            (
++                                value.len(),
++                                self.ts_config(language),
++                                matches!(language, Language::None),
++                            )
++                        } else {
++                            (0, PG_UNSTEMMED_LANG, false)
++                        };
+ 
+-                    if field.is_text() {
++                    if field.is_text() && unstemmed {
++                        let _ = write!(
++                            &mut query,
++                            "to_tsvector('{language}',{})",
++                            split_unstemmed(&value_ref)
++                        );
++                    } else if field.is_text() {
+                         let _ = write!(&mut query, "to_tsvector('{language}',{value_ref})");
+                     } else if text_len > 512 {
+                         query.push_str("left(");
+@@ -236,7 +246,15 @@ impl PostgresStore {
+                         };
+ 
+                         if matches!(language, Language::None) {
+-                            let _ = write!(query, "@@ {method}('{config}', ${value_pos})");
++                            // Both forms: the value as Postgres tokenises it, which is what a
++                            // row indexed before split_unstemmed holds, and split the way the
++                            // index now is. A search therefore finds rows from either side of
++                            // a reindex, and loses nothing while one is running.
++                            let _ = write!(
++                                query,
++                                "@@ ({method}('{config}', ${value_pos}) || {method}('{config}', {}))",
++                                split_unstemmed(&format!("${value_pos}"))
++                            );
+                         } else {
+                             let _ = write!(query, "@@ ({method}('{config}', ${value_pos})");
+                             for fallback in [PG_FALLBACK_LANG, PG_UNSTEMMED_LANG] {
+@@ -465,6 +483,35 @@ impl SearchOperator {
+ pub(super) const PG_FALLBACK_LANG: &str = "english";
+ pub(super) const PG_UNSTEMMED_LANG: &str = "simple";
+ 
++/// The SQL that splits a text parameter on every run of characters that are not letters or
++/// digits, for a field indexed without a language.
++///
++/// Postgres's parser keeps an e-mail address, a host name and a hyphenated word as ONE token,
++/// so such a field (the From/To/Cc/Bcc addresses, a calendar organizer, attendee or location,
++/// a contact's e-mail) could be found only by its whole value: `alex@example.com` indexed as
++/// the single token `alex@example.com`, and a search for the domain, a subdomain or a
++/// hyphenated domain matched nothing. Splitting on both the index and the query side gives the
++/// same tokens the internal search engine's SpaceTokenizer gives these fields.
++/// `[:alnum:]` follows the database's character classification, so letters outside ASCII
++/// stay whole in a UTF-8 database with a libc locale; if they did not, both sides would still
++/// split them identically.
++fn split_unstemmed(param: &str) -> String {
++    format!("regexp_replace({param}, '[^[:alnum:]]+', ' ', 'g')")
++}
++
++#[cfg(test)]
++mod split_unstemmed_tests {
++    use super::split_unstemmed;
++
++    #[test]
++    fn splits_the_parameter_it_is_given() {
++        assert_eq!(
++            split_unstemmed("$3"),
++            "regexp_replace($3, '[^[:alnum:]]+', ' ', 'g')"
++        );
++    }
++}
++
+ pub(super) const PG_LANGS: &[&str] = &[
+     "arabic",
+     "armenian",
