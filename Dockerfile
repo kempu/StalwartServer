@@ -6,7 +6,7 @@
 #
 # The stages are upstream's own Dockerfile, with three deliberate differences (README.md,
 # "Building"): every image is pinned by digest; only CARGO_FEATURES is compiled, without
-# `enterprise`; and the release profile uses thin LTO so the link fits a 4 GB runner.
+# `enterprise`; and the release profile uses thin LTO instead of fat.
 
 ARG CHEF_IMAGE
 ARG RUNTIME_IMAGE
@@ -34,9 +34,10 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
     g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
 RUN rustup target add "$(cat /target.txt)"
-# Thin LTO and 16 codegen units instead of upstream's fat LTO with one: the fat link of the
-# whole server needs far more memory than a 4 GB runner has. BUILD_JOBS bounds how many rustc
-# processes run at once, for the same reason.
+# Thin LTO and 16 codegen units instead of upstream's fat LTO with one, which needs several
+# times the memory and time. The thin-LTO link of the server still needs about 4 GB on its own,
+# so the builder needs 6 GB (README.md, "Building"). BUILD_JOBS is how many rustc processes run
+# at once.
 ENV CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 COPY --from=planner /recipe.json /recipe.json

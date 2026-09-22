@@ -28,5 +28,6 @@ RUNTIME_IMAGE="docker.io/library/debian:trixie-20260824-slim@sha256:d7e12182ce18
 # Stalwart Enterprise License, not the AGPL this repository is published under.
 CARGO_FEATURES="postgres s3"
 
-# Parallel rustc jobs. Bounded so the build fits a 4 GB runner; see README.md ("Building").
-BUILD_JOBS="2"
+# Parallel rustc jobs. The build's peak memory is the final link, about 4 GB whatever this is,
+# so this mostly sets how long the build takes; see README.md ("Building").
+BUILD_JOBS="6"
