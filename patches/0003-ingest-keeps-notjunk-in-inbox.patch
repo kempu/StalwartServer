@@ -1,0 +1,48 @@
+From cd82d911b14eed1f918788afd921c2a4b2f59f74 Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:30:24 +0200
+Subject: [PATCH 3/3] email ingest: keep a message the account's Sieve script
+ marked $notjunk in the Inbox
+
+Delivery files a message the spam filter classified as spam into Junk
+when it is headed for the Inbox. A Sieve script could not keep one out:
+`fileinto "INBOX"` resolves to the same destination as an implicit keep,
+so it was re-routed too. An organisation that trusts a sender therefore
+had no way to say "never treat this sender's mail as spam" from the
+account's script, and its trusted senders' mail still landed in Junk.
+
+Skip the re-route when the message carries $notjunk, the keyword a
+script sets with `addflag "$notjunk"`. A sender cannot set a keyword
+over SMTP; only the script the account owner or an administrator
+installed can. Every other spam message bound for the Inbox still goes
+to Junk with $junk, and nothing about classification or training
+changes.
+---
+ crates/email/src/message/ingest.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/crates/email/src/message/ingest.rs b/crates/email/src/message/ingest.rs
+index 7538ee4..189233c 100644
+--- a/crates/email/src/message/ingest.rs
++++ b/crates/email/src/message/ingest.rs
+@@ -354,7 +354,16 @@ impl EmailIngest for Server {
+                         offset_end: extra_headers.len() as u32,
+                     });
+ 
+-                    if is_spam && params.mailbox_ids == [INBOX_ID] {
++                    // Spam headed for the Inbox goes to Junk, unless the account's own Sieve
++                    // script marked it $notjunk. That keyword is the only way a script can keep
++                    // a message the filter scored as spam out of Junk: `fileinto "INBOX"`
++                    // resolves to the same destination as an implicit keep, and so is re-routed
++                    // here too. A sender cannot set a keyword over SMTP; only the script the
++                    // account owner or an administrator installed can.
++                    if is_spam
++                        && params.mailbox_ids == [INBOX_ID]
++                        && !params.keywords.contains(&Keyword::NotJunk)
++                    {
+                         params.mailbox_ids[0] = JUNK_ID;
+                         params.keywords.push(Keyword::Junk);
+                     }
+-- 
+2.52.0
+
