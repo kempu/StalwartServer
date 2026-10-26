@@ -8,13 +8,13 @@
 STALWART_REPO="https://github.com/stalwartlabs/stalwart.git"
 STALWART_TAG="v0.16.21"
 STALWART_COMMIT="e96200385781a6a9995a8b839ac27d6c75a983ee"
-RELEASE="v0.16.21-kempu.1"
+RELEASE="v0.16.21-kempu.2"
 
 # What the search index holds. Bump it whenever a patch (or an upstream update) changes what is
 # written to the index, and never otherwise: it is baked into the image as the label
 # io.github.kempu.stalwart-server.search-index-format, and a deployment compares that label with
 # the format its database was last reindexed to, and reindexes when they differ. "1" is patches
-# 0001 and 0002 over v0.16.21.
+# 0001 and 0002 over v0.16.21; 0003 does not change the index.
 SEARCH_INDEX_FORMAT="1"
 
 # Upstream's own image of that release, which the harness measures as the stock baseline.
