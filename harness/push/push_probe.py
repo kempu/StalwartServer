@@ -17,6 +17,8 @@ measured here, never read from source:
   4. With no properties, which is what the app asks for, the post is exactly
      {"@type": "EmailPush", "accountId": <the account>, "emails": [{}], "state": <state>}
      — the relay's wire contract.
+  5. emailPush is accepted in a CREATE beside `types`, which is how a new
+     registration sends it.
 
 Every negative is paired with a positive seen in the same run: a delivery that posts
 nothing proves nothing on its own. Run through `run.sh push IMAGE`.
@@ -174,6 +176,16 @@ def main():
     expect(len(bodies) == 1 and bodies[0].get("@type") == "EmailPush" and bodies[0].get("accountId") == acc
            and bodies[0].get("emails") == [{}] and isinstance(bodies[0].get("state"), str),
            f"no properties: the post is {{@type: EmailPush, accountId, emails: [{{}}], state}} ({json.dumps(bodies)})")
+
+    # 5. A new registration sends the filter IN the create, beside the types.
+    second = p.call(CORE, ["PushSubscription/set", {"create": {"s2": {
+        "deviceClientId": "push-harness-2", "url": "https://push.harness.test/push/h2",
+        "types": ["EmailDelivery"], "expires": expires,
+        "emailPush": {acc: {"filter": {"inMailboxOtherThan": excluded}, "properties": []}}}}}, "c2"])["c2"]["created"]["s2"]["id"]
+    read = p.call(CORE, ["PushSubscription/get", {"ids": [second], "properties": ["id", "types", "emailPush"]}, "g"])["g"]["list"][0]
+    expect(read.get("types") == ["EmailDelivery"]
+           and read.get("emailPush", {}).get(acc, {}).get("filter") == {"inMailboxOtherThan": excluded},
+           f"create: emailPush is accepted beside types ({json.dumps(read)})")
 
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} push probe(s) failed")
