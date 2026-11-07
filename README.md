@@ -85,6 +85,23 @@ stock indexed (nothing lost before the reindex), and answer correctly after it. 
 upstream update before moving `upstream.lock`; a probe whose stock answer changes is upstream
 fixing (or breaking) something, and says which.
 
+### The push harness
+
+```sh
+harness/run.sh push IMAGE                  # what a push subscription's emailPush filter lets through
+```
+
+The mail app narrows its push subscription with an `emailPush` filter so that mail a Sieve rule
+or the spam filter files into Archive, Junk, Trash, Sent or Drafts never wakes a phone, and the
+push relay wakes on the `EmailPush` object the server then posts. `push` measures every claim that
+rests on: without the filter an Archive delivery posts a `StateChange`; the filter can be set on
+a live subscription; with `inMailboxOtherThan` those five folders post nothing while the Inbox
+and a user's own folder each post one `EmailPush`; and with no properties the post is exactly
+`{"@type": "EmailPush", "accountId", "emails": [{}], "state"}`. Mail is delivered over SMTP
+because only the delivery path raises the push. A stand-in for the relay records the posts
+behind a certificate from a CA made for the run. Run it with the image being deployed, and on
+every upstream update.
+
 ## Hygiene
 
 Everything here is public, including every commit's author line. `scripts/check-hygiene.sh`

@@ -1,0 +1,32 @@
+# The push harness: the search harness plus a stand-in for the push relay. Layered over
+# ../docker-compose.yml by `run.sh push`. See push_probe.py.
+#
+# The catcher answers on https://push.harness.test (a name only this compose network
+# resolves) with a certificate from a CA generated per run; the server under test trusts
+# that CA and nothing else, through SSL_CERT_FILE, because Stalwart
+# accepts only https push URLs and verifies their certificates. SMTP is published to
+# 127.0.0.1 so the probe can deliver through the real ingest path: Email/import never
+# raises the push this harness is about.
+services:
+  catcher:
+    image: python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca
+    command: ["python3", "/catcher/catcher.py"]
+    volumes:
+      - ./push/catcher.py:/catcher/catcher.py:ro
+      - ${HARNESS_PUSH_CERTS:?run.sh sets it}:/certs:ro
+    networks:
+      default:
+        aliases: [push.harness.test]
+    ports:
+      - "127.0.0.1:${HARNESS_CATCHER_PORT:-18081}:8081"
+
+  stalwart:
+    depends_on:
+      catcher:
+        condition: service_started
+    environment:
+      SSL_CERT_FILE: /harness-ca/bundle.pem
+    volumes:
+      - ${HARNESS_PUSH_CERTS}:/harness-ca:ro
+    ports:
+      - "127.0.0.1:${HARNESS_SMTP_PORT:-12525}:25"
