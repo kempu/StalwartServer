@@ -74,7 +74,7 @@ case "${1:-}" in
     up "$patched"
     python3 probe.py check --expect patched-stale
     python3 probe.py reindex
-    python3 probe.py check --expect patched
+    python3 probe.py check --expect reindexed
     ;;
   push)
     up "${2:-$UPSTREAM_IMAGE}"

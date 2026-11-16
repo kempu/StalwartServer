@@ -12,8 +12,12 @@ image; see README.md ("The search harness").
 
 MODE is `stock` (upstream's image: the answers the patches change are the broken ones),
 `patched-stale` (our image over rows indexed by stock: must answer exactly as stock did,
-so a rollout never loses a match before its reindex), or `patched` (our image after the
-reindex: the answers are right).
+so a rollout never loses a match before its reindex), `patched` (our image over mail it
+ingested itself: the answers are right), or `reindexed` (our image over mail stock ingested,
+after the reindex: the searches are right, and what ingest decided is still stock's).
+
+It also asks whether each of a few messages has an attachment (patch 0004), on every surface
+that answers it: Email/get, the `hasAttachment` filter of Email/query, and Email/parse.
 
 Standard library only, and every name, address and word in it is invented.
 """
@@ -77,6 +81,85 @@ EVENTS = {
         "locations": {"l1": {"@type": "Location", "name": "Conference Rooms"}},
     },
 }
+
+# Messages with parts, for `hasAttachment` (patch 0004). Each carries ATTACH_MARKER rather
+# than MARKER, so the search probes above never see them.
+ATTACH_MARKER = "partsmarker"
+PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5E"
+       "rkJggg==")
+PDF = "JVBERi0xLjQKJSVFT0YK"
+LOGO = "logo.1@parts.example"
+
+def part(headers, body):
+    return "".join(f"{h}\r\n" for h in headers) + "\r\n" + body + "\r\n"
+
+def multipart(subtype, boundary, *parts):
+    return (f"Content-Type: multipart/{subtype}; boundary=\"{boundary}\"\r\n\r\n"
+            + "".join(f"--{boundary}\r\n{p}" for p in parts) + f"--{boundary}--\r\n")
+
+TEXT = part(["Content-Type: text/plain; charset=utf-8"], f"Hello from the parts probe.\r\n{ATTACH_MARKER}")
+HTML_LOGO = part(["Content-Type: text/html; charset=utf-8"],
+                 f'<p>Hello from the parts probe.</p><p>{ATTACH_MARKER}</p><img src="cid:{LOGO}" alt="logo">')
+HTML_PLAIN = part(["Content-Type: text/html; charset=utf-8"],
+                  f"<p>Hello from the parts probe.</p><p>{ATTACH_MARKER}</p>")
+
+def png(*headers):
+    return part(["Content-Type: image/png; name=\"logo.png\"", "Content-Transfer-Encoding: base64", *headers], PNG)
+
+# key: (subject, MIME body, {"stock": hasAttachment, "patched": hasAttachment})
+ATTACH_MESSAGES = {
+    # (a) A signature logo the HTML shows by its Content-ID, in the two shapes mail programs
+    # send it: related around the alternative, and related inside it.
+    "A1": ("Logo beside the alternative",
+           multipart("related", "r1",
+                     multipart("alternative", "a1", TEXT, HTML_LOGO),
+                     png(f"Content-ID: <{LOGO}>", "Content-Disposition: inline; filename=\"logo.png\"")),
+           {"stock": True, "patched": False}),
+    "A2": ("Logo inside the alternative",
+           multipart("alternative", "a2", TEXT,
+                     multipart("related", "r2", HTML_LOGO, png(f"Content-ID: <{LOGO}>"))),
+           {"stock": True, "patched": False}),
+    # (b) A real attachment.
+    "A3": ("A document attached",
+           multipart("mixed", "m3", TEXT,
+                     part(["Content-Type: application/pdf; name=\"plan.pdf\"", "Content-Transfer-Encoding: base64",
+                           "Content-Disposition: attachment; filename=\"plan.pdf\""], PDF)),
+           {"stock": True, "patched": True}),
+    # (c) A picture beside the HTML that the HTML cannot show: no Content-ID.
+    "A4": ("Picture without a Content-ID",
+           multipart("related", "r4", HTML_PLAIN, png("Content-Disposition: inline; filename=\"logo.png\"")),
+           {"stock": True, "patched": True}),
+    # A Content-ID the HTML never refers to.
+    "A5": ("Picture the HTML does not show",
+           multipart("related", "r5", HTML_PLAIN, png(f"Content-ID: <{LOGO}>")),
+           {"stock": True, "patched": True}),
+    # Shown by the HTML, but the sender marked it an attachment.
+    "A6": ("Shown picture marked attachment",
+           multipart("related", "r6", HTML_LOGO,
+                     png(f"Content-ID: <{LOGO}>", "Content-Disposition: attachment; filename=\"logo.png\"")),
+           {"stock": True, "patched": True}),
+    # An attached message always counts.
+    "A7": ("A message attached",
+           multipart("mixed", "m7", TEXT,
+                     part(["Content-Type: message/rfc822"],
+                          "From: Pat Quinn <pat@parts.example>\r\nSubject: Inner\r\n\r\nInner body.\r\n")),
+           {"stock": True, "patched": True}),
+    # Unchanged by any patch; recorded so a change upstream is noticed. A picture in a
+    # multipart/mixed that is not marked attachment is part of the body to mail-parser
+    # (InlineBinary, listed in textBody and htmlBody), and never counted.
+    "A8": ("Photo in the body",
+           multipart("mixed", "m8", TEXT, png("Content-Disposition: inline; filename=\"logo.png\"")),
+           {"stock": False, "patched": False}),
+}
+
+def attach_expected(mode, expect):
+    """(Email/get and Email/query, Email/parse). hasAttachment is decided at ingest and stored with
+    the message; Email/get returns what is stored, and the search index (which Email/query's
+    filter asks) is built from it, so over mail stock ingested both keep stock's answer, a reindex
+    included. Email/parse decides afresh from the blob, so it gives the server's own answer."""
+    stored = expect["stock"] if mode in ("stock", "patched-stale", "reindexed") else expect["patched"]
+    parsed = expect["stock"] if mode == "stock" else expect["patched"]
+    return stored, parsed
 
 # ---------------------------------------------------------------------------
 # The probes: (name, kind, filter, {mode: expected keys})
@@ -210,6 +293,12 @@ def seed():
                f"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n{MARKER}\r\n").encode()
         blob = http("POST", upload, raw, "message/rfc822")["blobId"]
         imports[key] = {"blobId": blob, "mailboxIds": {inbox: True}, "keywords": {"$seen": True}}
+    for key, (subject, body, _) in ATTACH_MESSAGES.items():
+        raw = (f"From: Pat Quinn <pat@parts.example>\r\nTo: Robin Hale <robin@parts.example>\r\n"
+               f"Subject: {subject}\r\nMessage-ID: <{key.lower()}@parts.example>\r\n"
+               f"Date: Tue, 01 Sep 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\n{body}").encode()
+        blob = http("POST", upload, raw, "message/rfc822")["blobId"]
+        imports[key] = {"blobId": blob, "mailboxIds": {inbox: True}, "keywords": {"$seen": True}}
     call(MAIL, ["Email/import", {"accountId": acc, "emails": imports}, "i"])
 
     cal_acc = account(sess, "urn:ietf:params:jmap:calendars")
@@ -221,16 +310,46 @@ def seed():
     call(CAL, ["CalendarEvent/set", {"accountId": cal_acc, "create": create}, "e"])
 
     wait_for("the mail index", lambda: len(query("mail", acc, {"text": MARKER})) == len(MESSAGES))
+    wait_for("the parts index", lambda: len(query("mail", acc, {"text": ATTACH_MARKER})) == len(ATTACH_MESSAGES))
     wait_for("the calendar index", lambda: len(query("cal", cal_acc, {"description": MARKER})) == len(EVENTS))
-    print(f"seeded {len(MESSAGES)} messages and {len(EVENTS)} events; all indexed")
+    print(f"seeded {len(MESSAGES) + len(ATTACH_MESSAGES)} messages and {len(EVENTS)} events; all indexed")
+
+def check_attachments(acc):
+    """Per message: what Email/get says, which ids the hasAttachment filter finds, what Email/parse says."""
+    ids = query("mail", acc, {"text": ATTACH_MARKER})
+    got = call(MAIL, ["Email/get", {"accountId": acc, "ids": ids,
+                                    "properties": ["subject", "blobId", "hasAttachment"]}, "g"])["g"]["list"]
+    by_subject = {v[0]: k for k, v in ATTACH_MESSAGES.items()}
+    emails = {by_subject[e["subject"]]: e for e in got}
+    flagged = set(query("mail", acc, {"operator": "AND", "conditions": [
+        {"text": ATTACH_MARKER}, {"hasAttachment": True}]}))
+    parsed = call(MAIL, ["Email/parse", {"accountId": acc, "blobIds": [e["blobId"] for e in got],
+                                         "properties": ["hasAttachment"]}, "p"])["p"]["parsed"]
+    return emails, flagged, parsed
 
 def check(mode, quiet=False):
     sess = session()
     accs = {"mail": account(sess), "cal": account(sess, "urn:ietf:params:jmap:calendars")}
     names = {k: keyed(k, a) for k, a in accs.items()}
     failures = 0
+    probes = len(PROBES) + 1 + len(ATTACH_MESSAGES)
+    emails, flagged, parsed = check_attachments(accs["mail"])
+    for key, (subject, _, expect) in ATTACH_MESSAGES.items():
+        stored, fresh = attach_expected(mode, expect)
+        e = emails[key]
+        got = (e["hasAttachment"], e["id"] in flagged, parsed[e["blobId"]]["hasAttachment"])
+        ok = got == (stored, stored, fresh)
+        failures += not ok
+        if not quiet:
+            print(f"{'PASS' if ok else 'FAIL'}  {'attachment: ' + subject:<44} "
+                  f"want get/query/parse {[stored, stored, fresh]}  got {list(got)}")
     for name, kind, flt, expect in PROBES:
-        want = expect.get(mode, expect["stock"]) if mode == "patched-stale" else expect[mode]
+        if mode == "patched-stale":
+            want = expect.get(mode, expect["stock"])
+        elif mode == "reindexed":
+            want = expect["patched"]
+        else:
+            want = expect[mode]
         got = {names[kind].get(i, f"?{i}") for i in query(kind, accs[kind], flt)}
         ok = got == want
         failures += not ok
@@ -242,7 +361,7 @@ def check(mode, quiet=False):
     failures += not ok
     if not quiet:
         print(f"{'PASS' if ok else 'FAIL'}  {'sort by subject keeps thread-name order':<44} want {SORT_EXPECTED}  got {order}")
-        print(f"\n{mode}: {len(PROBES) + 1 - failures} of {len(PROBES) + 1} as expected")
+        print(f"\n{mode}: {probes - failures} of {probes} as expected")
     return failures
 
 def reindex():
@@ -253,7 +372,7 @@ def reindex():
     # works through the store row by row, and the first visible one says nothing about the rest.
     # So wait until every patched answer holds, polling quietly; `check` then prints them once.
     # A patch that never produces them fails here, by timeout, naming what it waited for.
-    wait_for("every patched answer to hold after the reindex", lambda: check("patched", quiet=True) == 0, 600)
+    wait_for("every reindexed answer to hold after the reindex", lambda: check("reindexed", quiet=True) == 0, 600)
     print("reindex queued, and every row it rewrote is searchable")
 
 if __name__ == "__main__":
@@ -261,7 +380,7 @@ if __name__ == "__main__":
     if cmd == "seed":
         seed()
     elif cmd == "check" and len(sys.argv) == 4 and sys.argv[2] == "--expect" \
-            and sys.argv[3] in ("stock", "patched-stale", "patched"):
+            and sys.argv[3] in ("stock", "patched-stale", "patched", "reindexed"):
         sys.exit(1 if check(sys.argv[3]) else 0)
     elif cmd == "reindex":
         reindex()

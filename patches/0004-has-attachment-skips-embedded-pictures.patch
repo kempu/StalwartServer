@@ -1,0 +1,206 @@
+From 1a29ea5d5d0acd40591cf825c123c1aa7d327b5b Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:22:03 +0200
+Subject: [PATCH 4/4] email: a picture the HTML body shows by its Content-ID is not
+ an attachment
+
+hasAttachment was true for every Binary part. mail-parser never lists a
+picture the HTML refers to as cid: in html_body: inside a
+multipart/related only the first part is inline, so a signature logo
+next to the HTML is a Binary part, exactly as an attached file is. A
+message whose only extra part is such a logo therefore said it had an
+attachment, and the hasAttachment filter found it.
+
+A Binary part no longer counts when it has a Content-ID, is not marked
+Content-Disposition: attachment, and an HTML body part refers to it as
+cid:<that id> (compared without case), which RFC 8621 allows ("embedded
+images in one of the text/html parts"). A file marked attachment, a
+picture the HTML does not refer to, and an attached message still count.
+The Content-IDs are collected from the HTML in one pass, however many
+parts ask.
+
+Ingest (which stores the flag that Email/get, the search index and
+EmailPush read) and Email/parse each computed this on their own; both
+now call has_attachments(), so they agree. Email/parse also stops at
+MAX_MESSAGE_PARTS, as ingest always did.
+
+The flag is decided at ingest and stored with the message, and a reindex
+copies the stored flag, so mail ingested before this change keeps its
+answer.
+---
+ crates/email/src/message/index/metadata.rs | 21 +------
+ crates/email/src/message/index/mod.rs      | 65 +++++++++++++++++++++-
+ crates/jmap/src/email/parse.rs             | 14 +----
+ 3 files changed, 68 insertions(+), 32 deletions(-)
+
+diff --git a/crates/email/src/message/index/metadata.rs b/crates/email/src/message/index/metadata.rs
+index 50eff87..66fd672 100644
+--- a/crates/email/src/message/index/metadata.rs
++++ b/crates/email/src/message/index/metadata.rs
+@@ -5,7 +5,7 @@
+  */
+ 
+ use crate::message::{
+-    index::{IndexMessage, MAX_MESSAGE_PARTS, PREVIEW_LENGTH},
++    index::{IndexMessage, MAX_MESSAGE_PARTS, PREVIEW_LENGTH, has_attachments},
+     metadata::{
+         ArchivedMessageMetadata, ArchivedMessageMetadataPart, ArchivedMetadataHeaderName,
+         MESSAGE_HAS_ATTACHMENT, MESSAGE_RECEIVED_MASK, MessageData, MessageMetadata,
+@@ -108,7 +108,7 @@ impl IndexMessage for BatchBuilder {
+         data: MessageData,
+         received_at: u64,
+     ) -> trc::Result<&mut Self> {
+-        let mut has_attachments = false;
++        let has_attachments = has_attachments(&message);
+         let mut preview = None;
+         let preview_part_id = message
+             .text_body
+@@ -125,12 +125,6 @@ impl IndexMessage for BatchBuilder {
+                         preview =
+                             preview_text(text.replace('\r', "").into(), PREVIEW_LENGTH).into();
+                     }
+-
+-                    if !message.text_body.contains(&part_id)
+-                        && !message.html_body.contains(&part_id)
+-                    {
+-                        has_attachments = true;
+-                    }
+                 }
+                 mail_parser::PartType::Html(html) => {
+                     let text = html_to_text(html);
+@@ -138,17 +132,6 @@ impl IndexMessage for BatchBuilder {
+                         preview =
+                             preview_text(text.replace('\r', "").into(), PREVIEW_LENGTH).into();
+                     }
+-
+-                    if !message.text_body.contains(&part_id)
+-                        && !message.html_body.contains(&part_id)
+-                    {
+-                        has_attachments = true;
+-                    }
+-                }
+-                mail_parser::PartType::Binary(_) | mail_parser::PartType::Message(_)
+-                    if !has_attachments =>
+-                {
+-                    has_attachments = true;
+                 }
+                 _ => {}
+             }
+diff --git a/crates/email/src/message/index/mod.rs b/crates/email/src/message/index/mod.rs
+index c0c397d..471a5e9 100644
+--- a/crates/email/src/message/index/mod.rs
++++ b/crates/email/src/message/index/mod.rs
+@@ -9,7 +9,8 @@ use crate::{
+     message::metadata::{ArchivedMessageData, MessageData},
+ };
+ use common::storage::index::{IndexItem, IndexValue, IndexableObject};
+-use store::write::now;
++use mail_parser::{Message, MimeHeaders, PartType};
++use store::{ahash::AHashSet, write::now};
+ use types::{blob_hash::BlobHash, collection::SyncCollection, field::EmailField};
+ 
+ pub mod extractors;
+@@ -19,6 +20,68 @@ pub mod search;
+ pub(super) const MAX_MESSAGE_PARTS: usize = 1000;
+ pub const PREVIEW_LENGTH: usize = 256;
+ 
++/// Whether a message has a part a client should offer as a download: JMAP's `hasAttachment`.
++/// Ingest stores the answer and Email/parse computes it, and both ask here.
++///
++/// A text or HTML part counts when it is not part of the body, and an attached message always
++/// counts. Any other part counts unless it is a picture the HTML body shows: a part with a
++/// Content-ID, not marked `attachment`, that the HTML refers to as `cid:` (RFC 8621 lets a server
++/// leave out "embedded images in one of the text/html parts"). mail-parser never lists such a
++/// part in html_body: inside a multipart/related only the first part is inline, so a signature
++/// logo next to the HTML is a Binary part, exactly as an attachment is.
++pub fn has_attachments(message: &Message<'_>) -> bool {
++    let mut html_cids = None;
++
++    message
++        .parts
++        .iter()
++        .take(MAX_MESSAGE_PARTS)
++        .enumerate()
++        .any(|(part_id, part)| {
++            let part_id = part_id as u32;
++            match &part.body {
++                PartType::Text(_) | PartType::Html(_) => {
++                    !message.text_body.contains(&part_id) && !message.html_body.contains(&part_id)
++                }
++                PartType::Binary(_) => {
++                    part.content_disposition()
++                        .is_some_and(|disposition| disposition.is_attachment())
++                        || part.content_id().is_none_or(|cid| {
++                            !html_cids
++                                .get_or_insert_with(|| html_body_cids(message))
++                                .contains(&cid.to_ascii_lowercase())
++                        })
++                }
++                PartType::Message(_) => true,
++                PartType::InlineBinary(_) | PartType::Multipart(_) => false,
++            }
++        })
++}
++
++/// The Content-IDs the HTML body refers to as `cid:` URLs, lowercased. One pass over the HTML,
++/// however many parts ask.
++fn html_body_cids(message: &Message<'_>) -> AHashSet<String> {
++    let mut cids = AHashSet::new();
++    for part_id in &message.html_body {
++        if let Some(PartType::Html(html)) = message.parts.get(*part_id as usize).map(|p| &p.body) {
++            let html = html.to_ascii_lowercase();
++            for (pos, _) in html.match_indices("cid:") {
++                let cid = html[pos + 4..]
++                    .split(|c: char| {
++                        c.is_ascii_whitespace()
++                            || matches!(c, '"' | '\'' | ')' | '>' | '&' | ',' | ';')
++                    })
++                    .next()
++                    .unwrap_or_default();
++                if !cid.is_empty() {
++                    cids.insert(cid.to_string());
++                }
++            }
++        }
++    }
++    cids
++}
++
+ impl IndexableObject for MessageData {
+     fn index_values(&self) -> impl Iterator<Item = IndexValue<'_>> {
+         let mut mailboxes = Vec::with_capacity(self.mailboxes.len());
+diff --git a/crates/jmap/src/email/parse.rs b/crates/jmap/src/email/parse.rs
+index 8c89bdc..f680504 100644
+--- a/crates/jmap/src/email/parse.rs
++++ b/crates/jmap/src/email/parse.rs
+@@ -6,7 +6,7 @@
+ 
+ use crate::blob::download::BlobDownload;
+ use common::{Server, auth::AccessToken};
+-use email::message::index::PREVIEW_LENGTH;
++use email::message::index::{PREVIEW_LENGTH, has_attachments};
+ use email::message::{
+     body::{ToBodyPart, TruncateBody},
+     headers::HeaderToValue,
+@@ -146,17 +146,7 @@ impl EmailParse for Server {
+                     EmailProperty::HasAttachment => {
+                         email.insert_unchecked(
+                             EmailProperty::HasAttachment,
+-                            Value::Bool(message.parts.iter().enumerate().any(|(part_id, part)| {
+-                                let part_id = part_id as u32;
+-                                match &part.body {
+-                                    PartType::Html(_) | PartType::Text(_) => {
+-                                        !message.text_body.contains(&part_id)
+-                                            && !message.html_body.contains(&part_id)
+-                                    }
+-                                    PartType::Binary(_) | PartType::Message(_) => true,
+-                                    _ => false,
+-                                }
+-                            })),
++                            Value::Bool(has_attachments(&message)),
+                         );
+                     }
+                     EmailProperty::Preview => {
+-- 
+2.52.0
+

@@ -12,21 +12,30 @@ Nothing else lives here. There is no configuration, no deployment and no data.
 
 The first two patches are about search on a **PostgreSQL** data store, where Stalwart answers
 every full-text query with Postgres's own `tsvector` search. Each was measured against upstream's
-image before it was written, with the harness below. The third is about where spam is delivered.
-Each patch's commit message says what it changes.
+image before it was written, with the harness below. The third is about where spam is delivered,
+and the fourth about which mail is said to have an attachment. Each patch's commit message says
+what it changes.
 
 | Patch | Upstream behaviour | Patched |
 | --- | --- | --- |
 | [`0001`](patches/0001-postgres-split-unstemmed-fields.patch) | Postgres keeps an e-mail address, a host name and a hyphenated word as one token, so an address field matched only its whole value: searching a sender's domain, subdomain or hyphenated domain — or a calendar attendee's domain — found nothing. | Fields indexed without a language are split on punctuation when indexed and when queried, which is what Stalwart's internal search engine does for them. The query also matches the unsplit form, so rows indexed before the patch keep matching until a reindex rewrites them. |
 | [`0002`](patches/0002-subject-index-keeps-tag-words.patch) | The subject was indexed without its leading `[tags]` and reply prefixes, so a word inside `[Ticket ID: 4711]` could not be found, and a word only in the tag not at all. | The subject is indexed as its thread name followed by what was removed. Sorting by subject is unchanged. |
 | [`0003`](patches/0003-ingest-keeps-notjunk-in-inbox.patch) | A message the spam filter classified as spam is re-routed to Junk whenever it is headed for the Inbox, and a Sieve script cannot prevent it: `fileinto "INBOX"` is the same destination as an implicit keep. A sender an organisation trusts still lands in Junk. | A message the account's own Sieve script marked `$notjunk` stays in the Inbox. Every other spam message bound for the Inbox still goes to Junk. A sender cannot set a keyword; only the account's script can. |
+| [`0004`](patches/0004-has-attachment-skips-embedded-pictures.patch) | `hasAttachment` was true for every non-text part, so a message whose only extra part is a picture its HTML shows through a Content-ID (a signature logo in a `multipart/related`) said it had an attachment, and appeared under the `hasAttachment` filter. | A part with a Content-ID, not marked `attachment`, that the HTML body refers to as `cid:` is part of the body, as RFC 8621 allows. A real attachment, a picture the HTML does not show, and an attached message still count. Ingest and Email/parse decide it in one place. |
 
 `0001` and `0002` change what is stored in the index, so a deployment has to run a store-wide
-reindex once (`0003` does not touch the index). The image says which index it writes: the label
+reindex once (`0003` and `0004` do not touch the index). The image says which index it writes: the label
 `io.github.kempu.stalwart-server.search-index-format` (from `SEARCH_INDEX_FORMAT` in
 `upstream.lock`) changes exactly when the index does, so a deployment can compare it with what
 its database was last reindexed to and reindex only then. The harness's `rollout` mode rehearses
 that reindex.
+
+`0004` changes what delivery decides, not the index. Whether a message has an attachment is
+decided once, when it is delivered or imported, and stored with it; Email/get returns that, and a
+reindex rebuilds the index's `hasAttachment` from it rather than from the message. So mail
+delivered before the patched image keeps its old answer, a reindex included (the harness's
+`rollout` mode measures exactly that), and only Email/parse, which reads the message itself,
+answers afresh.
 
 ## Building
 
@@ -86,8 +95,15 @@ harness/run.sh rollout IMAGE               # stock indexes the data, the patched
                                            # answers from those rows, a reindex, then again
 ```
 
+It also imports a few messages with parts (a signature logo shown by its Content-ID in the two
+shapes mail programs send it, an attached document, a picture without a Content-ID, one the HTML
+does not show, a shown one marked `attachment`, an attached message, a photo in a
+`multipart/mixed` body) and asks each surface that answers `hasAttachment`: Email/get, the
+`hasAttachment` filter of Email/query, and Email/parse.
+
 `rollout` is the rollout itself: the patched server must answer exactly as stock did over rows
-stock indexed (nothing lost before the reindex), and answer correctly after it. Run it on every
+stock indexed (nothing lost before the reindex), and answer correctly after it, except that what
+delivery decided (`hasAttachment`) stays as stock decided it. Run it on every
 upstream update before moving `upstream.lock`; a probe whose stock answer changes is upstream
 fixing (or breaking) something, and says which.
 
