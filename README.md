@@ -46,7 +46,7 @@ The image is linux/amd64 whatever the host: the compile stages run on the build 
 cross-compile to x86_64, so an arm64 machine compiles natively and emulates only the runtime
 stage's few `RUN` steps.
 
-The Dockerfile is upstream's own, with three differences:
+The Dockerfile is upstream's own, with four differences:
 
 - **Every image is pinned by digest**; upstream's floats on `:latest`.
 - **Only `CARGO_FEATURES` is compiled** (`postgres s3`), and **not `enterprise`**: that code is
@@ -56,6 +56,12 @@ The Dockerfile is upstream's own, with three differences:
   edition as `oss` rather than `community`.
 - **Thin LTO and 16 codegen units**, instead of fat LTO with one unit, which needs several times
   the memory and time.
+- **OpenTelemetry comes from its own repository.** Upstream's `Cargo.lock` takes it from upstream's
+  fork, `github.com/stalwartlabs/opentelemetry-rust`, which is no longer public, so a build from
+  scratch could not fetch it. The commit the lock pins is still served by
+  `github.com/open-telemetry/opentelemetry-rust`, the repository the fork was made from, and the
+  build fetches it there (a git `insteadOf`). The lock file is unchanged and cargo checks the
+  checkout is the pinned commit, so the source is the same.
 
 **Memory.** Measured on v0.16.21-kempu.1: the build peaks at about 4.1 GB, and nearly all of it
 is the last step, linking the server with thin LTO across every crate, which needs about 4 GB

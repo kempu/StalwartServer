@@ -4,9 +4,10 @@
 # prepares the build context (the patched upstream tree) and copies this file into it; every
 # ARG below comes from upstream.lock and none has a default, so nothing here can drift.
 #
-# The stages are upstream's own Dockerfile, with three deliberate differences (README.md,
+# The stages are upstream's own Dockerfile, with four deliberate differences (README.md,
 # "Building"): every image is pinned by digest; only CARGO_FEATURES is compiled, without
-# `enterprise`; and the release profile uses thin LTO instead of fat.
+# `enterprise`; the release profile uses thin LTO instead of fat; and OpenTelemetry's pinned
+# commit is fetched from the OpenTelemetry repository, as upstream's fork of it is gone.
 
 ARG CHEF_IMAGE
 ARG RUNTIME_IMAGE
@@ -30,9 +31,16 @@ RUN case "${TARGETPLATFORM}" in \
     esac
 RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get update && \
-    apt-get install -yq --no-install-recommends build-essential libclang-19-dev \
+    apt-get install -yq --no-install-recommends build-essential libclang-19-dev git \
     g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
     g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
+# Cargo.lock takes OpenTelemetry from upstream's fork, github.com/stalwartlabs/opentelemetry-rust,
+# which is no longer public. The commit it pins is still served by the repository that fork was
+# made from, so fetch it there. Git checks the content against that commit hash and cargo checks
+# the checkout is that commit, so the source is the same; only the address differs.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN git config --global url."https://github.com/open-telemetry/opentelemetry-rust".insteadOf \
+    "https://github.com/stalwartlabs/opentelemetry-rust"
 RUN rustup target add "$(cat /target.txt)"
 # Thin LTO and 16 codegen units instead of upstream's fat LTO with one, which needs several
 # times the memory and time. The thin-LTO link of the server still needs about 4 GB on its own,
