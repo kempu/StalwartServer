@@ -8,7 +8,7 @@
 STALWART_REPO="https://github.com/stalwartlabs/stalwart.git"
 STALWART_TAG="v0.16.21"
 STALWART_COMMIT="e96200385781a6a9995a8b839ac27d6c75a983ee"
-RELEASE="v0.16.21-kempu.3"
+RELEASE="v0.16.21-kempu.4"
 
 # What the search index holds. Bump it whenever a patch (or an upstream update) changes what is
 # written to the index, and never otherwise: it is baked into the image as the label
@@ -16,6 +16,7 @@ RELEASE="v0.16.21-kempu.3"
 # the format its database was last reindexed to, and reindexes when they differ. "1" is patches
 # 0001 and 0002 over v0.16.21; 0003 does not change the index, and neither does 0004: it changes
 # the hasAttachment flag delivery stores with a message, and a reindex copies that stored flag.
+# 0005 and 0006 change authentication and what its errors log, not the index.
 SEARCH_INDEX_FORMAT="1"
 
 # Upstream's own image of that release, which the harness measures as the stock baseline.

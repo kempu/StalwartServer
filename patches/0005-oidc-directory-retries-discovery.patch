@@ -1,0 +1,1150 @@
+From a7ef13d9e0277a76290da5ad896c7228a3a5f2cc Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:59:05 +0200
+Subject: [PATCH 5/6] directory: build an OIDC directory whose identity
+ provider is down, and retry discovery on use
+
+OpenIdDirectory::new fetched the discovery document and the JWKS once.
+When either failed (the identity provider was down, or started after
+this server), open() returned an error, the directory was recorded as a
+build error and left out, and nothing ever tried again. Every Bearer
+token then fell through to the internal token decoder and was rejected
+as "Failed to decode token" until a restart. And with the directory
+missing, the default directory was missing too, so a Basic login went to
+the internal directory instead of the identity provider.
+
+The directory is now always built. Discovery is attempted when it is
+built and, when that fails, again when a token arrives: at most once per
+backoff period (10 s after the first failure, doubling to 30 s), by one
+caller at a time. A caller that arrives while an attempt is in flight
+does not wait for it. Until discovery succeeds every token presented to
+the directory is rejected as an authentication error ("Identity provider
+unavailable"): nothing is verified without the provider's keys, and an
+error is not a failed login, so it does not count towards an address's
+authentication ban. Once discovery succeeds the directory behaves as
+before: the issuer, audience and scope checks, the JWKS cache and its
+refresh on an unknown key id are unchanged.
+
+A failed attempt logs auth.warning with its cause and when the next one
+is due; the first success after failures logs resource.download-external
+(info: the only info-level auth event is auth.success). A discovery
+document for another issuer is a misconfiguration, not an outage: it is
+logged as auth.error and still retried, so fixing the provider does not
+need a restart here.
+
+/api/discover answers 503 for a domain whose identity provider has not
+been discovered, instead of this server's own metadata, which would send
+the client to the wrong issuer. The PACC record names the configured
+issuer URL, which needs no discovery.
+
+The tests run a stand-in provider on 127.0.0.1 that serves a JWKS with
+an RSA key made for the test (aws-lc-rs, already in the lock file, is a
+new dev-dependency). Upstream's own OIDC integration test (tests/, under
+the Stalwart Enterprise License, not built here) edits the discovery
+document through a field that no longer exists.
+---
+ Cargo.lock                                  |   1 +
+ crates/common/src/network/dns/records.rs    |   4 +-
+ crates/directory/Cargo.toml                 |   1 +
+ crates/directory/src/backend/oidc/config.rs | 290 +++++++++-----
+ crates/directory/src/backend/oidc/lookup.rs |  65 +++-
+ crates/directory/src/backend/oidc/mod.rs    |  40 +-
+ crates/directory/src/backend/oidc/tests.rs  | 407 ++++++++++++++++++++
+ crates/directory/src/core/dispatch.rs       |  20 +-
+ crates/http/src/auth/oauth/auth.rs          |  30 +-
+ 9 files changed, 731 insertions(+), 127 deletions(-)
+ create mode 100644 crates/directory/src/backend/oidc/tests.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index d963d6c..78c173d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2105,6 +2105,7 @@ version = "0.16.21"
+ dependencies = [
+  "ahash",
+  "argon2 0.6.0",
++ "aws-lc-rs",
+  "base64 0.23.1",
+  "deadpool",
+  "jsonwebtoken",
+diff --git a/crates/common/src/network/dns/records.rs b/crates/common/src/network/dns/records.rs
+index a2bba74..e38f6d8 100644
+--- a/crates/common/src/network/dns/records.rs
++++ b/crates/common/src/network/dns/records.rs
+@@ -390,8 +390,8 @@ impl Server {
+                 directory
+                     .and_then(|directory| {
+                         directory
+-                            .oidc_discovery_document()
+-                            .map(|doc| self.core.network.info.pacc.build(&doc.url))
++                            .oidc_issuer_url()
++                            .map(|url| self.core.network.info.pacc.build(url))
+                     })
+                     .unwrap_or_else(|| {
+                         self.core
+diff --git a/crates/directory/Cargo.toml b/crates/directory/Cargo.toml
+index 643dc3b..8f1c238 100644
+--- a/crates/directory/Cargo.toml
++++ b/crates/directory/Cargo.toml
+@@ -31,6 +31,7 @@ jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+ 
+ [dev-dependencies]
+ tokio = { version = "1.53", features = ["full"] }
++aws-lc-rs = { version = "1" }
+ 
+ [features]
+ test_mode = []
+diff --git a/crates/directory/src/backend/oidc/config.rs b/crates/directory/src/backend/oidc/config.rs
+index 0ed926f..5619c92 100644
+--- a/crates/directory/src/backend/oidc/config.rs
++++ b/crates/directory/src/backend/oidc/config.rs
+@@ -7,12 +7,20 @@
+ use crate::Directory;
+ use crate::backend::oidc::lookup::fetch_jwks_keys;
+ use crate::backend::oidc::{
+-    DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError, OpenIdDirectory,
++    Discovered, DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError,
++    OpenIdDirectory, RetryState,
+ };
+ use registry::schema::structs;
++use std::sync::OnceLock;
+ use std::time::{Duration, Instant};
+-use tokio::sync::RwLock;
++use tokio::sync::{Mutex, RwLock};
+ use trc::AuthEvent;
++use utils::Client;
++
++/// How long a directory waits before retrying a failed discovery: the first retry after
++/// DISCOVERY_RETRY_MIN, then twice as long each time, up to DISCOVERY_RETRY_MAX.
++const DISCOVERY_RETRY_MIN: Duration = Duration::from_secs(10);
++const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(30);
+ 
+ impl OpenIdDirectory {
+     pub async fn open(config: structs::OidcDirectory) -> Result<Directory, String> {
+@@ -30,115 +38,217 @@ impl OpenIdDirectory {
+         .map_err(|err| err.to_string())
+     }
+ 
++    /// Builds the directory, whether or not its identity provider can be reached now.
++    ///
++    /// Discovery is attempted at once, so a reachable provider is ready before the first token.
++    /// When it fails (the provider is down, or starts after this server), the directory is
++    /// built undiscovered rather than not at all: a directory that is missing is never retried,
++    /// and its tokens fall through to the internal token decoder until a restart. Undiscovered,
++    /// it rejects every token and retries discovery on use. Only a local failure (the HTTP
++    /// client cannot be built) is an error here.
+     pub async fn new(config: OidcConfig) -> Result<Self, OidcError> {
++        Self::with_retry(config, DISCOVERY_RETRY_MIN, DISCOVERY_RETRY_MAX).await
++    }
++
++    pub(super) async fn with_retry(
++        config: OidcConfig,
++        retry_min: Duration,
++        retry_max: Duration,
++    ) -> Result<Self, OidcError> {
+         let http = utils::http::http_client_builder(false)
+             .user_agent("Stalwart/1.0")
+             .timeout(Duration::from_secs(30))
+             .build()
+             .map_err(|e| OidcError::Network(format!("HTTP client build failed: {e}")))?;
+-        let discovery_url = format!(
+-            "{}/.well-known/openid-configuration",
+-            config.issue_url.trim_end_matches('/')
+-        );
+-        let discovery_bytes = http
+-            .get(&discovery_url)
+-            .send()
+-            .await
+-            .map_err(|e| OidcError::Network(format!("Discovery fetch failed: {e}")))?
+-            .error_for_status()
+-            .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?
+-            .bytes()
+-            .await
+-            .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?;
+-        let discovery: DiscoveryDocument = serde_json::from_slice(&discovery_bytes)
+-            .map_err(|e| OidcError::Provider(format!("Discovery JSON parse error: {e}")))?;
+-
+-        let normalised_issue = config.issue_url.trim_end_matches('/');
+-        let normalised_issuer = discovery.issuer.trim_end_matches('/');
+-        if normalised_issuer != normalised_issue {
+-            return Err(OidcError::Provider(format!(
+-                "Issuer mismatch: discovery document says '{}' but configured issue_url is '{}'",
+-                discovery.issuer, config.issue_url,
+-            )));
++        let directory = Self {
++            config,
++            http,
++            discovered: OnceLock::new(),
++            retry: Mutex::new(RetryState {
++                next_attempt: None,
++                delay: retry_min,
++                failures: 0,
++                last_error: String::new(),
++            }),
++            retry_min,
++            retry_max,
++        };
++
++        // A failure is logged by discovered() and retried on use; the directory exists either way.
++        let _ = directory.discovered().await;
++
++        Ok(directory)
++    }
++
++    pub fn issuer_url(&self) -> &str {
++        &self.config.issue_url
++    }
++
++    /// The discovery document and the signing keys, discovering them first if that has not
++    /// succeeded yet. Fails with OidcError::Unavailable while discovery keeps failing.
++    pub(crate) async fn discovered(&self) -> Result<&Discovered, OidcError> {
++        if let Some(discovered) = self.discovered.get() {
++            return Ok(discovered);
+         }
+ 
+-        if let Some(supported) = &discovery.scopes_supported {
+-            for scope in &config.require_scopes {
+-                if !supported.contains(scope) {
++        // One attempt at a time. A caller that arrives while one is in flight does not wait for
++        // it, since a provider that does not answer would hold it for the whole HTTP timeout: it
++        // is rejected, as every caller is until discovery succeeds. Within the backoff nobody
++        // contacts the provider. So a failing provider is asked at most once per backoff period,
++        // however many tokens arrive.
++        let Ok(mut retry) = self.retry.try_lock() else {
++            return Err(OidcError::Unavailable(
++                "discovery is in progress".to_string(),
++            ));
++        };
++        if let Some(discovered) = self.discovered.get() {
++            return Ok(discovered);
++        }
++        if let Some(next_attempt) = retry.next_attempt {
++            let now = Instant::now();
++            if now < next_attempt {
++                return Err(OidcError::Unavailable(format!(
++                    "discovery has not succeeded, next attempt in {}s: {}",
++                    (next_attempt - now).as_secs_f64().ceil(),
++                    retry.last_error
++                )));
++            }
++        }
++
++        let started = Instant::now();
++        match discover(&self.http, &self.config).await {
++            Ok(discovered) => {
++                if retry.failures > 0 {
+                     trc::event!(
+-                        Auth(AuthEvent::Warning),
+-                        Url = config.issue_url.to_string(),
+-                        Reason = format!(
+-                            "Required scope '{}' is not in scopes_supported from the IdP",
+-                            scope
+-                        )
++                        Resource(trc::ResourceEvent::DownloadExternal),
++                        Url = self.config.issue_url.to_string(),
++                        Details = "OIDC discovery succeeded after failing; this directory's tokens are verified again",
++                        Total = retry.failures,
++                        Elapsed = started.elapsed(),
+                     );
+                 }
++                *retry = RetryState {
++                    next_attempt: None,
++                    delay: self.retry_min,
++                    failures: 0,
++                    last_error: String::new(),
++                };
++                Ok(self.discovered.get_or_init(|| discovered))
+             }
+-        }
++            Err(err) => {
++                let delay = if retry.failures == 0 {
++                    self.retry_min
++                } else {
++                    (retry.delay * 2).min(self.retry_max)
++                };
++                retry.failures += 1;
++                retry.delay = delay;
++                retry.next_attempt = Some(Instant::now() + delay);
++                retry.last_error = err.to_string();
+ 
+-        if let Some(supported) = &discovery.claims_supported {
+-            let check = |name: &str, label: &str| {
+-                if !supported.iter().any(|c| c == name) {
++                let reason = format!(
++                    "OIDC discovery failed (attempt {}), so every token for this directory is rejected until it succeeds; next attempt in {}s: {err}",
++                    retry.failures,
++                    delay.as_secs()
++                );
++                // A provider that answers with a document for another issuer is misconfigured,
++                // not down: it is still retried (the provider may be mid-deployment, and fixing
++                // it must not need a restart here), but it is logged as an error.
++                if matches!(err, OidcError::Configuration(_)) {
++                    trc::event!(
++                        Auth(AuthEvent::Error),
++                        Url = self.config.issue_url.to_string(),
++                        Reason = reason,
++                    );
++                } else {
+                     trc::event!(
+                         Auth(AuthEvent::Warning),
+-                        Url = config.issue_url.to_string(),
+-                        Reason = format!(
+-                            "Configured {} claim '{}' is not in claims_supported from the IdP",
+-                            label, name
+-                        )
++                        Url = self.config.issue_url.to_string(),
++                        Reason = reason,
+                     );
+                 }
+-            };
+-            check(&config.claim_email, "claim_email");
+-            if let Some(n) = &config.claim_name {
+-                check(n, "claim_name");
+-            }
+-            if let Some(g) = &config.claim_groups {
+-                check(g, "claim_groups");
++
++                Err(OidcError::Unavailable(retry.last_error.clone()))
+             }
+         }
++    }
++}
+ 
+-        /*{
+-            let cache = Arc::clone(&cache);
+-            let http = http.clone();
+-            let jwks_uri = discovery.jwks_uri.clone();
+-            tokio::spawn(async move {
+-                let mut interval = tokio::time::interval(Duration::from_secs(24 * 3600));
+-                interval.tick().await;
+-                loop {
+-                    interval.tick().await;
+-                    match fetch_jwks_keys(&http, &jwks_uri).await {
+-                        Ok(new_keys) => {
+-                            let mut guard = cache.write().await;
+-                            guard.keys = new_keys;
+-                            guard.last_updated = Instant::now();
+-                        }
+-                        Err(e) => {
+-                            trc::event!(
+-                                Auth(AuthEvent::Warning),
+-                                Url = jwks_uri.to_string(),
+-                                Reason = format!("Background JWKS refresh failed: {e}")
+-                            );
+-                        }
+-                    }
+-                }
+-            });
+-        }*/
++/// Fetches and checks the discovery document, then the JWKS it names.
++async fn discover(http: &Client, config: &OidcConfig) -> Result<Discovered, OidcError> {
++    let discovery_url = format!(
++        "{}/.well-known/openid-configuration",
++        config.issue_url.trim_end_matches('/')
++    );
++    let discovery_bytes = http
++        .get(&discovery_url)
++        .send()
++        .await
++        .map_err(|e| OidcError::Network(format!("Discovery fetch failed: {e}")))?
++        .error_for_status()
++        .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?
++        .bytes()
++        .await
++        .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?;
++    let discovery: DiscoveryDocument = serde_json::from_slice(&discovery_bytes)
++        .map_err(|e| OidcError::Provider(format!("Discovery JSON parse error: {e}")))?;
+ 
+-        let cache = RwLock::new(JwksCache {
+-            keys: fetch_jwks_keys(&http, &discovery.jwks_uri).await?,
+-            last_updated: Instant::now(),
+-        });
++    let normalised_issue = config.issue_url.trim_end_matches('/');
++    let normalised_issuer = discovery.issuer.trim_end_matches('/');
++    if normalised_issuer != normalised_issue {
++        return Err(OidcError::Configuration(format!(
++            "Issuer mismatch: discovery document says '{}' but configured issue_url is '{}'",
++            discovery.issuer, config.issue_url,
++        )));
++    }
+ 
+-        Ok(Self {
+-            discovery: OidcDiscovery {
+-                url: config.issue_url.clone(),
+-                document: discovery,
+-            },
+-            config,
+-            http,
+-            cache,
+-        })
++    if let Some(supported) = &discovery.scopes_supported {
++        for scope in &config.require_scopes {
++            if !supported.contains(scope) {
++                trc::event!(
++                    Auth(AuthEvent::Warning),
++                    Url = config.issue_url.to_string(),
++                    Reason = format!(
++                        "Required scope '{}' is not in scopes_supported from the IdP",
++                        scope
++                    )
++                );
++            }
++        }
++    }
++
++    if let Some(supported) = &discovery.claims_supported {
++        let check = |name: &str, label: &str| {
++            if !supported.iter().any(|c| c == name) {
++                trc::event!(
++                    Auth(AuthEvent::Warning),
++                    Url = config.issue_url.to_string(),
++                    Reason = format!(
++                        "Configured {} claim '{}' is not in claims_supported from the IdP",
++                        label, name
++                    )
++                );
++            }
++        };
++        check(&config.claim_email, "claim_email");
++        if let Some(n) = &config.claim_name {
++            check(n, "claim_name");
++        }
++        if let Some(g) = &config.claim_groups {
++            check(g, "claim_groups");
++        }
+     }
++
++    let keys = fetch_jwks_keys(http, &discovery.jwks_uri).await?;
++
++    Ok(Discovered {
++        discovery: OidcDiscovery {
++            url: config.issue_url.clone(),
++            document: discovery,
++        },
++        cache: RwLock::new(JwksCache {
++            keys,
++            last_updated: Instant::now(),
++        }),
++    })
+ }
+diff --git a/crates/directory/src/backend/oidc/lookup.rs b/crates/directory/src/backend/oidc/lookup.rs
+index 91ff6cb..1dfe080 100644
+--- a/crates/directory/src/backend/oidc/lookup.rs
++++ b/crates/directory/src/backend/oidc/lookup.rs
+@@ -6,7 +6,7 @@
+ 
+ use crate::{
+     Account, Credentials,
+-    backend::oidc::{CachedKey, OidcError, OpenIdDirectory},
++    backend::oidc::{CachedKey, Discovered, OidcError, OpenIdDirectory},
+ };
+ use ahash::AHashMap;
+ use jsonwebtoken::{
+@@ -25,12 +25,20 @@ impl OpenIdDirectory {
+             Credentials::Bearer { token, .. } if token.is_empty() => {
+                 Err(AuthEvent::Failed.into_err().reason("Empty token rejected"))
+             }
+-            Credentials::Bearer { token, .. } => if let Ok(header) = decode_header(token) {
+-                self.authenticate_jwt(token, header).await
+-            } else {
+-                #[cfg(feature = "test_mode")]
+-                let token = token.strip_prefix(".").unwrap_or(token);
+-                self.authenticate_opaque(token).await
++            // No token is looked at before discovery has succeeded: without the provider's keys
++            // nothing can be verified, so an undiscovered directory rejects every token as
++            // unavailable (an error, never a failed login that fail2ban would count).
++            Credentials::Bearer { token, .. } => match self.discovered().await {
++                Ok(discovered) => {
++                    if let Ok(header) = decode_header(token) {
++                        self.authenticate_jwt(discovered, token, header).await
++                    } else {
++                        #[cfg(feature = "test_mode")]
++                        let token = token.strip_prefix(".").unwrap_or(token);
++                        self.authenticate_opaque(discovered, token).await
++                    }
++                }
++                Err(err) => Err(err),
+             }
+             .map_err(|err| match err {
+                 OidcError::AuthorizationFailed(reason) => {
+@@ -44,7 +52,12 @@ impl OpenIdDirectory {
+         }
+     }
+ 
+-    async fn authenticate_jwt(&self, token: &str, header: Header) -> Result<Account, OidcError> {
++    async fn authenticate_jwt(
++        &self,
++        discovered: &Discovered,
++        token: &str,
++        header: Header,
++    ) -> Result<Account, OidcError> {
+         if matches!(
+             header.alg,
+             Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+@@ -54,7 +67,7 @@ impl OpenIdDirectory {
+             ));
+         }
+ 
+-        let candidates = self.get_key(header.kid.as_deref()).await?;
++        let candidates = self.get_key(discovered, header.kid.as_deref()).await?;
+         let mut last_err = None;
+         for cached in &candidates {
+             let dk = &cached.decoding_key;
+@@ -67,7 +80,7 @@ impl OpenIdDirectory {
+                 validation.validate_aud = false;
+             }
+ 
+-            validation.set_issuer(&[&self.discovery.document.issuer]);
++            validation.set_issuer(&[&discovered.discovery.document.issuer]);
+             validation.leeway = 60;
+ 
+             match decode::<serde_json::Value>(token, dk, &validation) {
+@@ -88,7 +101,7 @@ impl OpenIdDirectory {
+                             || is_claim_missing(&claims, self.config.claim_groups.as_ref());
+ 
+                     if jwt_email.is_none() || missing_profile {
+-                        match self.fetch_userinfo(token).await {
++                        match self.fetch_userinfo(discovered, token).await {
+                             Ok(userinfo) => {
+                                 if let (Some(base), Value::Object(extra)) =
+                                     (claims.as_object_mut(), userinfo)
+@@ -123,14 +136,22 @@ impl OpenIdDirectory {
+         )))
+     }
+ 
+-    async fn authenticate_opaque(&self, token: &str) -> Result<Account, OidcError> {
+-        let claims = self.fetch_userinfo(token).await?;
++    async fn authenticate_opaque(
++        &self,
++        discovered: &Discovered,
++        token: &str,
++    ) -> Result<Account, OidcError> {
++        let claims = self.fetch_userinfo(discovered, token).await?;
+         self.build_account(self.resolve_email(&claims)?, &claims)
+     }
+ 
+-    async fn get_key(&self, kid: Option<&str>) -> Result<Vec<Arc<CachedKey>>, OidcError> {
++    async fn get_key(
++        &self,
++        discovered: &Discovered,
++        kid: Option<&str>,
++    ) -> Result<Vec<Arc<CachedKey>>, OidcError> {
+         {
+-            let guard = self.cache.read().await;
++            let guard = discovered.cache.read().await;
+ 
+             if let Some(kid) = kid {
+                 if let Some(cached) = guard.keys.get(kid) {
+@@ -148,14 +169,14 @@ impl OpenIdDirectory {
+             }
+         }
+ 
+-        let new_keys = fetch_jwks_keys(&self.http, &self.discovery.document.jwks_uri).await?;
++        let new_keys = fetch_jwks_keys(&self.http, &discovered.discovery.document.jwks_uri).await?;
+         {
+-            let mut guard = self.cache.write().await;
++            let mut guard = discovered.cache.write().await;
+             guard.keys = new_keys;
+             guard.last_updated = Instant::now();
+         }
+ 
+-        let guard = self.cache.read().await;
++        let guard = discovered.cache.read().await;
+         if let Some(kid) = kid {
+             if let Some(cached) = guard.keys.get(kid) {
+                 Ok(vec![cached.clone()])
+@@ -176,10 +197,14 @@ impl OpenIdDirectory {
+         }
+     }
+ 
+-    async fn fetch_userinfo(&self, token: &str) -> Result<serde_json::Value, OidcError> {
++    async fn fetch_userinfo(
++        &self,
++        discovered: &Discovered,
++        token: &str,
++    ) -> Result<serde_json::Value, OidcError> {
+         let resp = self
+             .http
+-            .get(&self.discovery.document.userinfo_endpoint)
++            .get(&discovered.discovery.document.userinfo_endpoint)
+             .bearer_auth(token)
+             .send()
+             .await
+diff --git a/crates/directory/src/backend/oidc/mod.rs b/crates/directory/src/backend/oidc/mod.rs
+index 03ad48c..403e54a 100644
+--- a/crates/directory/src/backend/oidc/mod.rs
++++ b/crates/directory/src/backend/oidc/mod.rs
+@@ -7,12 +7,18 @@
+ use ahash::AHashMap;
+ use jsonwebtoken::{Algorithm, DecodingKey};
+ use serde::{Deserialize, Serialize};
+-use std::{fmt, sync::Arc, time::Instant};
+-use tokio::sync::RwLock;
++use std::{
++    fmt,
++    sync::{Arc, OnceLock},
++    time::{Duration, Instant},
++};
++use tokio::sync::{Mutex, RwLock};
+ use utils::Client;
+ 
+ pub mod config;
+ pub mod lookup;
++#[cfg(test)]
++mod tests;
+ 
+ pub struct OidcConfig {
+     pub issue_url: String,
+@@ -56,11 +62,33 @@ struct JwksCache {
+     last_updated: Instant,
+ }
+ 
++/// What a successful discovery yields: the provider's discovery document and the signing keys
++/// its JWKS published. A directory has none of it until discovery succeeds, and then keeps it.
++pub(crate) struct Discovered {
++    pub(crate) discovery: OidcDiscovery,
++    cache: RwLock<JwksCache>,
++}
++
++/// When discovery may next be attempted while it keeps failing. Its lock is held for the whole
++/// of an attempt, so there is never more than one.
++struct RetryState {
++    next_attempt: Option<Instant>,
++    delay: Duration,
++    failures: u32,
++    last_error: String,
++}
++
++/// An OpenID Connect directory. Discovery (the discovery document and the JWKS) is attempted
++/// when the directory is built and, when the provider cannot be reached then, again on use, at
++/// most once per backoff period and by one caller at a time. Until it succeeds every token is
++/// rejected: nothing can be verified without the provider's keys.
+ pub struct OpenIdDirectory {
+     config: OidcConfig,
+-    pub discovery: OidcDiscovery,
+     http: Client,
+-    cache: RwLock<JwksCache>,
++    discovered: OnceLock<Discovered>,
++    retry: Mutex<RetryState>,
++    retry_min: Duration,
++    retry_max: Duration,
+ }
+ 
+ #[derive(Debug)]
+@@ -69,6 +97,8 @@ pub enum OidcError {
+     AuthorizationFailed(String),
+     Network(String),
+     Provider(String),
++    Configuration(String),
++    Unavailable(String),
+ }
+ 
+ impl fmt::Display for OidcError {
+@@ -78,6 +108,8 @@ impl fmt::Display for OidcError {
+             OidcError::AuthorizationFailed(msg) => write!(f, "Authorization failed: {msg}"),
+             OidcError::Network(msg) => write!(f, "Network error: {msg}"),
+             OidcError::Provider(msg) => write!(f, "Provider error: {msg}"),
++            OidcError::Configuration(msg) => write!(f, "Configuration error: {msg}"),
++            OidcError::Unavailable(msg) => write!(f, "Identity provider unavailable: {msg}"),
+         }
+     }
+ }
+diff --git a/crates/directory/src/backend/oidc/tests.rs b/crates/directory/src/backend/oidc/tests.rs
+new file mode 100644
+index 0000000..1a84843
+--- /dev/null
++++ b/crates/directory/src/backend/oidc/tests.rs
+@@ -0,0 +1,407 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++//! An OIDC directory against a stand-in identity provider on 127.0.0.1: a few lines of HTTP
++//! that serve a discovery document and a JWKS holding an RSA key generated for the test, and
++//! that can be down (nothing listening), failing (503) or misconfigured (another issuer).
++
++use super::{OidcConfig, OpenIdDirectory};
++use crate::{Credentials, Directory};
++use aws_lc_rs::{
++    rand::SystemRandom,
++    rsa::{KeyPair, KeySize},
++    signature::{KeyPair as _, RSA_PKCS1_SHA256},
++};
++use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++use serde_json::{Value, json};
++use std::{
++    net::SocketAddr,
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::{Duration, SystemTime},
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::TcpListener,
++    task::JoinHandle,
++};
++
++const RETRY_MIN: Duration = Duration::from_secs(2);
++const RETRY_MAX: Duration = Duration::from_secs(4);
++const EMAIL: &str = "alex.chen@example.org";
++const AUDIENCE: &str = "mail-test";
++
++#[derive(Clone, Copy, PartialEq)]
++enum Mode {
++    Serve,
++    Unavailable,
++}
++
++struct MockIdp {
++    requests: Arc<AtomicUsize>,
++    state: Arc<Mutex<(Mode, String)>>,
++    task: JoinHandle<()>,
++}
++
++impl MockIdp {
++    /// Serves on `addr`: the discovery document (whose issuer is `issuer`) and `jwks`.
++    async fn start(addr: SocketAddr, issuer: &str, jwks: Value, mode: Mode) -> Self {
++        let listener = TcpListener::bind(addr).await.expect("rebind the IdP port");
++        let requests = Arc::new(AtomicUsize::new(0));
++        let state = Arc::new(Mutex::new((mode, issuer.to_string())));
++        let base = format!("http://{addr}");
++        let task = {
++            let requests = requests.clone();
++            let state = state.clone();
++            tokio::spawn(async move {
++                loop {
++                    let Ok((mut stream, _)) = listener.accept().await else {
++                        return;
++                    };
++                    let requests = requests.clone();
++                    let state = state.clone();
++                    let base = base.clone();
++                    let jwks = jwks.clone();
++                    tokio::spawn(async move {
++                        let mut buf = Vec::new();
++                        let mut chunk = [0u8; 1024];
++                        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
++                            match stream.read(&mut chunk).await {
++                                Ok(0) | Err(_) => return,
++                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
++                            }
++                        }
++                        requests.fetch_add(1, Ordering::SeqCst);
++                        let request = String::from_utf8_lossy(&buf);
++                        let path = request.split_whitespace().nth(1).unwrap_or_default();
++                        let (mode, issuer) = state.lock().unwrap().clone();
++                        let (status, body) = match (mode, path) {
++                            (Mode::Unavailable, _) => ("503 Service Unavailable", String::new()),
++                            (_, "/.well-known/openid-configuration") => (
++                                "200 OK",
++                                json!({
++                                    "issuer": issuer,
++                                    "jwks_uri": format!("{base}/jwks"),
++                                    "userinfo_endpoint": format!("{base}/userinfo"),
++                                    "token_endpoint": format!("{base}/token"),
++                                    "authorization_endpoint": format!("{base}/auth"),
++                                })
++                                .to_string(),
++                            ),
++                            (_, "/jwks") => ("200 OK", jwks.to_string()),
++                            _ => ("404 Not Found", String::new()),
++                        };
++                        let response = format!(
++                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
++                            body.len()
++                        );
++                        let _ = stream.write_all(response.as_bytes()).await;
++                        let _ = stream.shutdown().await;
++                    });
++                }
++            })
++        };
++
++        MockIdp {
++            requests,
++            state,
++            task,
++        }
++    }
++
++    fn requests(&self) -> usize {
++        self.requests.load(Ordering::SeqCst)
++    }
++
++    fn set(&self, mode: Mode, issuer: &str) {
++        *self.state.lock().unwrap() = (mode, issuer.to_string());
++    }
++}
++
++impl Drop for MockIdp {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++
++/// A port nothing listens on: the identity provider is down.
++fn free_port() -> SocketAddr {
++    std::net::TcpListener::bind("127.0.0.1:0")
++        .unwrap()
++        .local_addr()
++        .unwrap()
++}
++
++fn rsa_key() -> KeyPair {
++    KeyPair::generate(KeySize::Rsa2048).unwrap()
++}
++
++fn jwks(key: &KeyPair, kid: &str) -> Value {
++    let public = key.public_key();
++    json!({"keys": [{
++        "kty": "RSA",
++        "kid": kid,
++        "use": "sig",
++        "alg": "RS256",
++        "n": URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),
++        "e": URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero()),
++    }]})
++}
++
++fn claims(issuer: &str) -> Value {
++    let now = SystemTime::now()
++        .duration_since(SystemTime::UNIX_EPOCH)
++        .unwrap()
++        .as_secs();
++    json!({
++        "iss": issuer,
++        "aud": AUDIENCE,
++        "sub": "0d4c2f5e",
++        "email": EMAIL,
++        "name": "Alex Chen",
++        "iat": now,
++        "exp": now + 300,
++    })
++}
++
++fn sign(key: &KeyPair, kid: &str, claims: &Value) -> String {
++    let header = json!({"alg": "RS256", "typ": "JWT", "kid": kid});
++    let input = format!(
++        "{}.{}",
++        URL_SAFE_NO_PAD.encode(header.to_string()),
++        URL_SAFE_NO_PAD.encode(claims.to_string())
++    );
++    let mut signature = vec![0; key.public_modulus_len()];
++    key.sign(
++        &RSA_PKCS1_SHA256,
++        &SystemRandom::new(),
++        input.as_bytes(),
++        &mut signature,
++    )
++    .unwrap();
++    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
++}
++
++fn unsigned(claims: &Value) -> String {
++    format!(
++        "{}.{}.",
++        URL_SAFE_NO_PAD.encode(json!({"alg": "none", "typ": "JWT"}).to_string()),
++        URL_SAFE_NO_PAD.encode(claims.to_string())
++    )
++}
++
++async fn directory(issuer: &str) -> Directory {
++    Directory::OpenId(
++        OpenIdDirectory::with_retry(
++            OidcConfig {
++                issue_url: issuer.to_string(),
++                require_aud: Some(AUDIENCE.to_string()),
++                require_scopes: vec![],
++                claim_email: "email".to_string(),
++                claim_name: Some("name".to_string()),
++                claim_groups: None,
++                default_domain: None,
++            },
++            RETRY_MIN,
++            RETRY_MAX,
++        )
++        .await
++        .expect("a directory is built whether or not its provider answers"),
++    )
++}
++
++fn bearer(token: &str) -> Credentials {
++    Credentials::Bearer {
++        username: None,
++        token: token.to_string(),
++    }
++}
++
++/// Rejected as the provider being unavailable: an error, never a failed login (which fail2ban
++/// would count against the user's address) and never a success.
++async fn assert_unavailable(directory: &Directory, token: &str) {
++    let err = directory
++        .authenticate(&bearer(token))
++        .await
++        .expect_err("a token was accepted by an undiscovered directory");
++    assert!(
++        matches!(err.as_ref(), trc::EventType::Auth(trc::AuthEvent::Error)),
++        "{err:?}"
++    );
++    assert!(
++        format!("{err:?}").contains("Identity provider unavailable"),
++        "{err:?}"
++    );
++}
++
++#[tokio::test]
++async fn directory_built_while_the_idp_is_down_recovers_without_a_restart() {
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let key = rsa_key();
++    let token = sign(&key, "k1", &claims(&issuer));
++
++    // Built while nothing listens: upstream returned an error here and the directory was left
++    // out until a restart.
++    let directory = directory(&issuer).await;
++    assert_unavailable(&directory, &token).await;
++    assert!(matches!(
++        directory.oidc_discovery_document().await,
++        Some(Err(_))
++    ));
++    assert_eq!(directory.oidc_issuer_url(), Some(issuer.as_str()));
++
++    // The provider comes up. Within the backoff it is not asked, and the token still fails.
++    let idp = MockIdp::start(addr, &issuer, jwks(&key, "k1"), Mode::Serve).await;
++    assert_unavailable(&directory, &token).await;
++    assert_eq!(idp.requests(), 0, "asked the provider inside the backoff");
++
++    // After the backoff the next token rediscovers the provider and is verified.
++    tokio::time::sleep(RETRY_MIN + Duration::from_millis(300)).await;
++    let account = directory.authenticate(&bearer(&token)).await.unwrap();
++    assert_eq!(account.email, EMAIL);
++    assert_eq!(account.description.as_deref(), Some("Alex Chen"));
++    assert_eq!(idp.requests(), 2, "discovery document and JWKS");
++    let discovery = directory.oidc_discovery_document().await.unwrap().unwrap();
++    assert_eq!(discovery.document.issuer, issuer);
++
++    // Discovered, it behaves as upstream: the signature, the audience and the issuer are
++    // still checked, and a known key is not fetched again.
++    let forged = sign(&rsa_key(), "k1", &claims(&issuer));
++    let mut wrong_audience = claims(&issuer);
++    wrong_audience["aud"] = json!("another-client");
++    let mut wrong_issuer = claims(&issuer);
++    wrong_issuer["iss"] = json!("https://idp.example.net");
++    for token in [
++        forged,
++        sign(&key, "k1", &wrong_audience),
++        sign(&key, "k1", &wrong_issuer),
++        unsigned(&claims(&issuer)),
++    ] {
++        let err = directory.authenticate(&bearer(&token)).await.unwrap_err();
++        assert!(
++            !format!("{err:?}").contains("Identity provider unavailable"),
++            "{err:?}"
++        );
++    }
++    // The keys were not fetched again. The unsigned token is not a JWT the library accepts, so
++    // it went to the userinfo endpoint (upstream's opaque-token path), which refused it.
++    assert_eq!(idp.requests(), 3);
++}
++
++#[tokio::test]
++async fn an_undiscovered_directory_rejects_every_token() {
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let key = rsa_key();
++    let directory = directory(&issuer).await;
++
++    let tokens = [
++        sign(&key, "k1", &claims(&issuer)),
++        sign(&key, "unknown-kid", &claims(&issuer)),
++        unsigned(&claims(&issuer)),
++        "an-opaque-access-token".to_string(),
++    ];
++    for token in &tokens {
++        assert_unavailable(&directory, token).await;
++    }
++
++    // The retry after the backoff fails too, and so does every token after it.
++    tokio::time::sleep(RETRY_MIN + Duration::from_millis(300)).await;
++    for token in &tokens {
++        assert_unavailable(&directory, token).await;
++    }
++}
++
++#[tokio::test]
++async fn a_failing_provider_is_asked_once_per_backoff_however_many_tokens_arrive() {
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let key = rsa_key();
++    let idp = MockIdp::start(addr, &issuer, jwks(&key, "k1"), Mode::Unavailable).await;
++    let directory = Arc::new(directory(&issuer).await);
++    assert_eq!(idp.requests(), 1, "the attempt when the directory is built");
++
++    tokio::time::sleep(RETRY_MIN + Duration::from_millis(300)).await;
++    let token = sign(&key, "k1", &claims(&issuer));
++    let attempts = (0..25)
++        .map(|_| {
++            let directory = directory.clone();
++            let token = token.clone();
++            tokio::spawn(async move { directory.authenticate(&bearer(&token)).await })
++        })
++        .collect::<Vec<_>>();
++    for attempt in attempts {
++        assert!(attempt.await.unwrap().is_err());
++    }
++    assert_eq!(idp.requests(), 2, "one retry for 25 concurrent tokens");
++
++    // The provider recovers; the next attempt is after the doubled backoff, and succeeds.
++    idp.set(Mode::Serve, &issuer);
++    tokio::time::sleep(RETRY_MAX + Duration::from_millis(300)).await;
++    assert_eq!(
++        directory.authenticate(&bearer(&token)).await.unwrap().email,
++        EMAIL
++    );
++}
++
++#[tokio::test]
++async fn a_token_does_not_wait_for_an_attempt_in_flight() {
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let directory = Arc::new(directory(&issuer).await);
++    let token = sign(&rsa_key(), "k1", &claims(&issuer));
++
++    // The provider accepts connections and never answers.
++    let _blackhole = std::net::TcpListener::bind(addr).unwrap();
++    tokio::time::sleep(RETRY_MIN + Duration::from_millis(300)).await;
++    let stuck = {
++        let directory = directory.clone();
++        let token = token.clone();
++        tokio::spawn(async move { directory.authenticate(&bearer(&token)).await })
++    };
++    tokio::time::sleep(Duration::from_millis(300)).await;
++
++    let started = std::time::Instant::now();
++    assert_unavailable(&directory, &token).await;
++    assert!(
++        started.elapsed() < Duration::from_secs(1),
++        "waited for the attempt"
++    );
++    stuck.abort();
++}
++
++#[tokio::test]
++async fn a_document_for_another_issuer_is_rejected_and_retried() {
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let key = rsa_key();
++    let token = sign(&key, "k1", &claims(&issuer));
++    let idp = MockIdp::start(
++        addr,
++        "https://idp.example.net",
++        jwks(&key, "k1"),
++        Mode::Serve,
++    )
++    .await;
++    let directory = directory(&issuer).await;
++
++    let err = directory.authenticate(&bearer(&token)).await.unwrap_err();
++    assert!(format!("{err:?}").contains("Issuer mismatch"), "{err:?}");
++    assert_eq!(
++        idp.requests(),
++        1,
++        "no JWKS is fetched for a mismatched issuer"
++    );
++
++    // Fixing the provider needs no restart here.
++    idp.set(Mode::Serve, &issuer);
++    tokio::time::sleep(RETRY_MIN + Duration::from_millis(300)).await;
++    assert_eq!(
++        directory.authenticate(&bearer(&token)).await.unwrap().email,
++        EMAIL
++    );
++}
+diff --git a/crates/directory/src/core/dispatch.rs b/crates/directory/src/core/dispatch.rs
+index 21e47cd..d76d179 100644
+--- a/crates/directory/src/core/dispatch.rs
++++ b/crates/directory/src/core/dispatch.rs
+@@ -34,9 +34,25 @@ impl Directory {
+         !matches!(self, Directory::OpenId(_))
+     }
+ 
+-    pub fn oidc_discovery_document(&self) -> Option<&OidcDiscovery> {
++    /// The issuer URL an OIDC directory is configured with, discovered or not.
++    pub fn oidc_issuer_url(&self) -> Option<&str> {
+         match &self {
+-            Directory::OpenId(directory) => Some(&directory.discovery),
++            Directory::OpenId(directory) => Some(directory.issuer_url()),
++            _ => None,
++        }
++    }
++
++    /// An OIDC directory's discovery document, discovering it first when that has not
++    /// succeeded yet. `Some(Err)` while the identity provider cannot be reached.
++    pub async fn oidc_discovery_document(&self) -> Option<trc::Result<&OidcDiscovery>> {
++        match &self {
++            Directory::OpenId(directory) => Some(
++                directory
++                    .discovered()
++                    .await
++                    .map(|discovered| &discovered.discovery)
++                    .map_err(|err| trc::AuthEvent::Error.into_err().reason(err)),
++            ),
+             _ => None,
+         }
+     }
+diff --git a/crates/http/src/auth/oauth/auth.rs b/crates/http/src/auth/oauth/auth.rs
+index 5b640e4..238751d 100644
+--- a/crates/http/src/auth/oauth/auth.rs
++++ b/crates/http/src/auth/oauth/auth.rs
+@@ -23,6 +23,7 @@ use common::{
+ };
+ use directory::Credentials;
+ use http_proto::*;
++use hyper::StatusCode;
+ use std::future::Future;
+ use store::{
+     Serialize,
+@@ -150,18 +151,29 @@ impl OAuthApiHandler for Server {
+             .recovery_admin()
+             .is_some_and(|(user, _)| user.trim().eq_ignore_ascii_case(auth_as.address()));
+ 
+-        if !is_recovery_admin
++        let directory = if !is_recovery_admin
+             && let Some(domain_name) = auth_as.domain().filter(|domain| !domain.is_empty())
+-            && let Some(endpoint) = self
+-                .get_directory_for_domain(domain_name)
+-                .await?
+-                .and_then(|directory| directory.oidc_discovery_document())
+         {
+-            Ok(JsonResponse::new(&endpoint.document)
+-                .no_cache()
+-                .into_http_response())
++            self.get_directory_for_domain(domain_name).await?
+         } else {
+-            self.handle_oidc_metadata(!session.is_tls).await
++            None
++        };
++        let discovery = match directory {
++            Some(directory) => directory.oidc_discovery_document().await,
++            None => None,
++        };
++
++        match discovery {
++            Some(Ok(endpoint)) => Ok(JsonResponse::new(&endpoint.document)
++                .no_cache()
++                .into_http_response()),
++            // The domain signs in through an identity provider this server has not reached yet.
++            // Answering with this server's own metadata would send the client to the wrong
++            // issuer; it is told to come back instead.
++            Some(Err(_)) => Ok(JsonProblemResponse(StatusCode::SERVICE_UNAVAILABLE)
++                .into_http_response()
++                .with_no_cache()),
++            None => self.handle_oidc_metadata(!session.is_tls).await,
+         }
+     }
+ 
+-- 
+2.52.0
+

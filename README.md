@@ -13,8 +13,9 @@ Nothing else lives here. There is no configuration, no deployment and no data.
 The first two patches are about search on a **PostgreSQL** data store, where Stalwart answers
 every full-text query with Postgres's own `tsvector` search. Each was measured against upstream's
 image before it was written, with the harness below. The third is about where spam is delivered,
-and the fourth about which mail is said to have an attachment. Each patch's commit message says
-what it changes.
+and the fourth about which mail is said to have an attachment. The fifth and sixth are about
+authentication: an OIDC directory that outlives its identity provider being down, and errors that
+never log a credential. Each patch's commit message says what it changes.
 
 | Patch | Upstream behaviour | Patched |
 | --- | --- | --- |
@@ -22,9 +23,11 @@ what it changes.
 | [`0002`](patches/0002-subject-index-keeps-tag-words.patch) | The subject was indexed without its leading `[tags]` and reply prefixes, so a word inside `[Ticket ID: 4711]` could not be found, and a word only in the tag not at all. | The subject is indexed as its thread name followed by what was removed. Sorting by subject is unchanged. |
 | [`0003`](patches/0003-ingest-keeps-notjunk-in-inbox.patch) | A message the spam filter classified as spam is re-routed to Junk whenever it is headed for the Inbox, and a Sieve script cannot prevent it: `fileinto "INBOX"` is the same destination as an implicit keep. A sender an organisation trusts still lands in Junk. | A message the account's own Sieve script marked `$notjunk` stays in the Inbox. Every other spam message bound for the Inbox still goes to Junk. A sender cannot set a keyword; only the account's script can. |
 | [`0004`](patches/0004-has-attachment-skips-embedded-pictures.patch) | `hasAttachment` was true for every non-text part, so a message whose only extra part is a picture its HTML shows through a Content-ID (a signature logo in a `multipart/related`) said it had an attachment, and appeared under the `hasAttachment` filter. | A part with a Content-ID, not marked `attachment`, that the HTML body refers to as `cid:` is part of the body, as RFC 8621 allows. A real attachment, a picture the HTML does not show, and an attached message still count. Ingest and Email/parse decide it in one place. |
+| [`0005`](patches/0005-oidc-directory-retries-discovery.patch) | An OIDC directory fetched its identity provider's discovery document and keys once, when it was built. If the provider could not be reached then (it was down, or started after the server), the directory was left out and never retried: every Bearer token fell through to the internal decoder and was rejected until a restart, and Basic logins went to the internal directory instead. | The directory is always built. While its provider cannot be reached it rejects every token as an authentication error (not a failed login, so no ban counts it), and retries discovery when a token arrives, at most once per 10 to 30 seconds and by one caller at a time, without making anyone wait for an attempt in flight. Once discovery succeeds it verifies tokens exactly as before. `/api/discover` answers 503 for such a domain rather than the server's own metadata. |
+| [`0006`](patches/0006-auth-errors-omit-credentials.patch) | An authentication error logged the credential it rejected: a whole Bearer or refresh token that did not decode, the value of an `Authorization` header with an unknown scheme or an undecodable Basic header, a stored password (plaintext for an LDAP or SQL directory that stores them so) or hash that could not be verified, and a TOTP URI with its secret. | Each error says what failed without the value. The trace-level raw protocol events, which record the wire by design, are unchanged. |
 
 `0001` and `0002` change what is stored in the index, so a deployment has to run a store-wide
-reindex once (`0003` and `0004` do not touch the index). The image says which index it writes: the label
+reindex once (`0003` to `0006` do not touch the index). The image says which index it writes: the label
 `io.github.kempu.stalwart-server.search-index-format` (from `SEARCH_INDEX_FORMAT` in
 `upstream.lock`) changes exactly when the index does, so a deployment can compare it with what
 its database was last reindexed to and reindex only then. The harness's `rollout` mode rehearses
@@ -36,6 +39,12 @@ reindex rebuilds the index's `hasAttachment` from it rather than from the messag
 delivered before the patched image keeps its old answer, a reindex included (the harness's
 `rollout` mode measures exactly that), and only Email/parse, which reads the message itself,
 answers afresh.
+
+`0005` and `0006` carry their own tests, run in the patched tree (`src/` after
+`scripts/ci-prepare.sh`): `cargo test -p directory` builds OIDC directories against a stand-in
+identity provider on 127.0.0.1 that is down, failing, misconfigured or serving a key made for the
+test, and checks that a stored secret never reaches an error; `cargo test -p common --lib
+auth::oauth::token` checks the same for a token that does not decode.
 
 ## Building
 
