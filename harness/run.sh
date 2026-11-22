@@ -7,6 +7,9 @@
 #                                                    stock -> patched over stale rows -> reindex
 #   harness/run.sh push    [IMAGE]                   which deliveries a push subscription's
 #                                                    emailPush filter lets through (push/push_probe.py)
+#   harness/run.sh sharing EXPECT [IMAGE]            whether a person a collection is shared with chooses
+#                                                    its subscription (sharing/sharing_probe.py); EXPECT
+#                                                    is stock or patched
 #
 # IMAGE defaults to UPSTREAM_IMAGE, upstream's own image of the release upstream.lock pins. Every run starts
 # from an empty database and removes it again; the passwords are generated per run and
@@ -80,8 +83,13 @@ case "${1:-}" in
     up "${2:-$UPSTREAM_IMAGE}"
     python3 push/push_probe.py
     ;;
+  sharing)
+    expect="${2:?give stock or patched}"
+    up "${3:-$UPSTREAM_IMAGE}"
+    python3 sharing/sharing_probe.py "$expect"
+    ;;
   *)
-    sed -n '2,14p' "$0" >&2
+    sed -n '2,17p' "$0" >&2
     exit 2
     ;;
 esac

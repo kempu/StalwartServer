@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Klemens Arro <1125090+kempu@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:00:00 +0200
+Subject: [PATCH] jmap: a person a calendar or address book is shared with
+ chooses its subscription, and a shared calendar starts unsubscribed
+
+A client decides from isSubscribed whether a collection someone shared
+is in that person's app: adding it subscribes, removing it unsubscribes.
+Two things kept that from working for calendars and address books.
+
+Calendar/set and AddressBook/set refused any update to a shared
+collection without Acl::Modify, the right to change the collection
+itself. isSubscribed only writes the requester's own entry (their
+calendar preferences, the address book's subscriber list), yet a person
+who may only read the collection could neither subscribe nor
+unsubscribe it. Mailbox/set already takes a subscription-only change
+with Acl::Read. Do the same here: an update that sets isSubscribed and
+nothing else (besides the id) needs read access, and must resolve to
+the requester's own id, never the owner's. Every other change, a
+subscription sent together with one included, still needs Acl::Modify.
+
+A shared calendar read as subscribed before the person had chosen:
+Calendar::preferences falls back to the first entry, the owner's, so a
+sharee saw the owner's own setting. Every calendar a person was given,
+including one added later to an account they had removed, therefore
+joined their app by itself. A shared mailbox and a shared address book
+read as unsubscribed until the person subscribes. Read a sharee's
+calendar subscription from their own entry only, off when there is
+none. The owner, and a member of an owning group, read it as before.
+---
+ crates/jmap/src/addressbook/set.rs | 30 +++++++++++++++++++++++++++++-
+ crates/jmap/src/calendar/get.rs    | 18 +++++++++++++++---
+ crates/jmap/src/calendar/set.rs    | 30 +++++++++++++++++++++++++++++-
+ 3 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/crates/jmap/src/addressbook/set.rs b/crates/jmap/src/addressbook/set.rs
+index 9086aa8..e906409 100644
+--- a/crates/jmap/src/addressbook/set.rs
++++ b/crates/jmap/src/addressbook/set.rs
+@@ -174,6 +174,19 @@ impl AddressBookSet for Server {
+                 .deserialize::<AddressBook>()
+                 .caused_by(trc::location!())?;
+ 
++            // A change to the requester's own subscription, and nothing else, needs only read
++            // access, as it does for a mailbox: it writes their own entry and no one else's.
++            // Every other change, a subscription sent together with one included, still needs
++            // the right to modify the address book.
++            let subscription_only = object.as_object().is_some_and(|object| {
++                object
++                    .keys()
++                    .any(|key| matches!(key, Key::Property(AddressBookProperty::IsSubscribed)))
++                    && object.keys().all(|key| {
++                        matches!(key, Key::Property(AddressBookProperty::IsSubscribed | AddressBookProperty::Id))
++                    })
++            });
++
+             // Apply changes
+             let has_acl_changes = match update_address_book(
+                 Some(id),
+@@ -192,7 +205,22 @@ impl AddressBookSet for Server {
+             // Validate ACL
+             if is_shared {
+                 let acl = address_book.inner.acls.effective_acl(access_token);
+-                if !acl.contains(Acl::Modify) || (has_acl_changes && !acl.contains(Acl::Share)) {
++                if subscription_only {
++                    // A sharee's own id, never the owner's: the change must not reach anyone
++                    // else's subscription.
++                    if !acl.contains(Acl::Read)
++                        || access_token.personal_id(account_id, Collection::AddressBook) == account_id
++                    {
++                        response.not_updated.append(
++                            id,
++                            SetError::forbidden()
++                                .with_description("You are not allowed to access this address book."),
++                        );
++                        continue 'update;
++                    }
++                } else if !acl.contains(Acl::Modify)
++                    || (has_acl_changes && !acl.contains(Acl::Share))
++                {
+                     response.not_updated.append(
+                         id,
+                         SetError::forbidden()
+diff --git a/crates/jmap/src/calendar/get.rs b/crates/jmap/src/calendar/get.rs
+index 76c36c9..1c2fb9a 100644
+--- a/crates/jmap/src/calendar/get.rs
++++ b/crates/jmap/src/calendar/get.rs
+@@ -164,11 +164,23 @@ impl CalendarGet for Server {
+                         );
+                     }
+                     CalendarProperty::IsSubscribed => {
++                        // The owner (or a member of the owning group) reads the calendar's own
++                        // setting. Anyone it is shared with reads only their own choice, and has
++                        // made none until they subscribe, as with a shared mailbox or address
++                        // book. `preferences()` falls back to the owner's entry, so without this
++                        // every calendar a person was given, including one added later to an
++                        // account they had removed, read as subscribed on its own.
++                        let subscribed = if is_owner {
++                            calendar.preferences(personal_id).flags & CALENDAR_SUBSCRIBED != 0
++                        } else {
++                            calendar.preferences.iter().any(|prefs| {
++                                prefs.account_id == personal_id
++                                    && prefs.flags & CALENDAR_SUBSCRIBED != 0
++                            })
++                        };
+                         result.insert_unchecked(
+                             CalendarProperty::IsSubscribed,
+-                            Value::Bool(
+-                                calendar.preferences(personal_id).flags & CALENDAR_SUBSCRIBED != 0,
+-                            ),
++                            Value::Bool(subscribed),
+                         );
+                     }
+                     CalendarProperty::Color => {
+diff --git a/crates/jmap/src/calendar/set.rs b/crates/jmap/src/calendar/set.rs
+index f41f10b..7a99dc8 100644
+--- a/crates/jmap/src/calendar/set.rs
++++ b/crates/jmap/src/calendar/set.rs
+@@ -178,6 +178,19 @@ impl CalendarSet for Server {
+                 .deserialize::<Calendar>()
+                 .caused_by(trc::location!())?;
+ 
++            // A change to the requester's own subscription, and nothing else, needs only read
++            // access, as it does for a mailbox: it writes their own entry and no one else's.
++            // Every other change, a subscription sent together with one included, still needs
++            // the right to modify the calendar.
++            let subscription_only = object.as_object().is_some_and(|object| {
++                object
++                    .keys()
++                    .any(|key| matches!(key, Key::Property(CalendarProperty::IsSubscribed)))
++                    && object.keys().all(|key| {
++                        matches!(key, Key::Property(CalendarProperty::IsSubscribed | CalendarProperty::Id))
++                    })
++            });
++
+             // Apply changes
+             let has_acl_changes = match update_calendar(
+                 Some(id),
+@@ -196,7 +209,22 @@ impl CalendarSet for Server {
+             // Validate ACL
+             if is_shared {
+                 let acl = calendar.inner.acls.effective_acl(access_token);
+-                if !acl.contains(Acl::Modify) || (has_acl_changes && !acl.contains(Acl::Share)) {
++                if subscription_only {
++                    // A sharee's own id, never the owner's: the change must not reach anyone
++                    // else's subscription.
++                    if !acl.contains(Acl::Read)
++                        || access_token.personal_id(account_id, Collection::Calendar) == account_id
++                    {
++                        response.not_updated.append(
++                            id,
++                            SetError::forbidden()
++                                .with_description("You are not allowed to access this calendar."),
++                        );
++                        continue 'update;
++                    }
++                } else if !acl.contains(Acl::Modify)
++                    || (has_acl_changes && !acl.contains(Acl::Share))
++                {
+                     response.not_updated.append(
+                         id,
+                         SetError::forbidden()
+-- 
+2.52.0
