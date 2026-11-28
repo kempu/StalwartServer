@@ -1,8 +1,8 @@
-From 1a29ea5d5d0acd40591cf825c123c1aa7d327b5b Mon Sep 17 00:00:00 2001
+From 7a855b961daa72834ef0f7b82871fc53f38ae004 Mon Sep 17 00:00:00 2001
 From: Klemens Arro <1125090+kempu@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 21:22:03 +0200
-Subject: [PATCH 4/4] email: a picture the HTML body shows by its Content-ID is not
- an attachment
+Subject: [PATCH 4/7] email: a picture the HTML body shows by its Content-ID is
+ not an attachment
 
 hasAttachment was true for every Binary part. mail-parser never lists a
 picture the HTML refers to as cid: in html_body: inside a

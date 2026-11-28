@@ -1,20 +1,29 @@
-From a7ef13d9e0277a76290da5ad896c7228a3a5f2cc Mon Sep 17 00:00:00 2001
+From a8c35811992134dd6b635088e3973baeb6cd68eb Mon Sep 17 00:00:00 2001
 From: Klemens Arro <1125090+kempu@users.noreply.github.com>
-Date: Thu, 19 Nov 2026 14:59:05 +0200
-Subject: [PATCH 5/6] directory: build an OIDC directory whose identity
+Date: Sat, 28 Nov 2026 17:09:03 +0200
+Subject: [PATCH 5/7] directory: build an OIDC directory whose identity
  provider is down, and retry discovery on use
 
-OpenIdDirectory::new fetched the discovery document and the JWKS once.
-When either failed (the identity provider was down, or started after
-this server), open() returned an error, the directory was recorded as a
-build error and left out, and nothing ever tried again. Every Bearer
-token then fell through to the internal token decoder and was rejected
-as "Failed to decode token" until a restart. And with the directory
-missing, the default directory was missing too, so a Basic login went to
-the internal directory instead of the identity provider.
+OpenIdDirectory::new fetches the discovery document and the JWKS when
+the directory is built. Upstream retries that for 30 seconds, every 3
+seconds, while the provider cannot be reached or answers with an error
+(0.16.22), and then gives up: open() returns an error, the directory is
+recorded as a build error and stands in as an Unavailable placeholder,
+and nothing ever tries again. Every Bearer token for it is then rejected
+("Directory is unavailable because it failed to initialize") until a
+restart, or a registry reload that rebuilds the directories while the
+provider is up. The 30 seconds also hold up the server's start, and each
+registry reload that rebuilds the directories, whenever the provider is
+down; and a reload that records the build error is not applied at all.
 
-The directory is now always built. Discovery is attempted when it is
-built and, when that fails, again when a token arrives: at most once per
+The directory is now always built, after one discovery attempt and
+without waiting: upstream's 30-second loop is removed rather than kept
+in front of the retry below. For a provider that comes up within those
+30 seconds it saved a token at most the 10-second backoff, at the price
+of the whole server starting, or a reload being applied, up to 30
+seconds late (longer when an attempt runs into the 30-second HTTP
+timeout); for one that stays down it bought nothing. When the attempt
+fails, discovery is tried again when a token arrives: at most once per
 backoff period (10 s after the first failure, doubling to 30 s), by one
 caller at a time. A caller that arrives while an attempt is in flight
 does not wait for it. Until discovery succeeds every token presented to
@@ -22,44 +31,54 @@ the directory is rejected as an authentication error ("Identity provider
 unavailable"): nothing is verified without the provider's keys, and an
 error is not a failed login, so it does not count towards an address's
 authentication ban. Once discovery succeeds the directory behaves as
-before: the issuer, audience and scope checks, the JWKS cache and its
-refresh on an unknown key id are unchanged.
+upstream: the issuer, audience and scope checks, the userinfo fallback,
+the JWKS cache and its refresh on an unknown key id are unchanged.
 
 A failed attempt logs auth.warning with its cause and when the next one
 is due; the first success after failures logs resource.download-external
 (info: the only info-level auth event is auth.success). A discovery
-document for another issuer is a misconfiguration, not an outage: it is
+document for another issuer (upstream's OidcError::Config, which its
+startup loop does not retry) is a misconfiguration, not an outage: it is
 logged as auth.error and still retried, so fixing the provider does not
 need a restart here.
 
 /api/discover answers 503 for a domain whose identity provider has not
-been discovered, instead of this server's own metadata, which would send
-the client to the wrong issuer. The PACC record names the configured
-issuer URL, which needs no discovery.
+been discovered, or whose OIDC directory could not be built at all,
+instead of this server's own metadata, which would send the client to
+the wrong issuer. The PACC record names the configured issuer URL, which
+needs no discovery, and the issuer match that routes a token without a
+domain claim to its directory (enterprise only, not built here) compares
+with that URL too, so an undiscovered directory still claims its own
+tokens.
 
 The tests run a stand-in provider on 127.0.0.1 that serves a JWKS with
 an RSA key made for the test (aws-lc-rs, already in the lock file, is a
-new dev-dependency). Upstream's own OIDC integration test (tests/, under
-the Stalwart Enterprise License, not built here) edits the discovery
-document through a field that no longer exists.
+new dev-dependency). One of them builds directories against a provider
+that is down and one that answers 503 and fails if building takes 2
+seconds; it fails with upstream's loop put back. Upstream's own OIDC
+integration tests (tests/, under the Stalwart Enterprise License, not
+built here) edit the discovery document through a field that no longer
+exists, and call oidc_discovery_document(), now async, as a plain
+function.
 ---
  Cargo.lock                                  |   1 +
+ crates/common/src/auth/authentication.rs    |   7 +-
  crates/common/src/network/dns/records.rs    |   4 +-
  crates/directory/Cargo.toml                 |   1 +
- crates/directory/src/backend/oidc/config.rs | 290 +++++++++-----
- crates/directory/src/backend/oidc/lookup.rs |  65 +++-
- crates/directory/src/backend/oidc/mod.rs    |  40 +-
- crates/directory/src/backend/oidc/tests.rs  | 407 ++++++++++++++++++++
- crates/directory/src/core/dispatch.rs       |  20 +-
+ crates/directory/src/backend/oidc/config.rs | 171 ++++++--
+ crates/directory/src/backend/oidc/lookup.rs |  65 ++-
+ crates/directory/src/backend/oidc/mod.rs    |  38 +-
+ crates/directory/src/backend/oidc/tests.rs  | 450 ++++++++++++++++++++
+ crates/directory/src/core/dispatch.rs       |  26 +-
  crates/http/src/auth/oauth/auth.rs          |  30 +-
- 9 files changed, 731 insertions(+), 127 deletions(-)
+ 10 files changed, 723 insertions(+), 70 deletions(-)
  create mode 100644 crates/directory/src/backend/oidc/tests.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index d963d6c..78c173d 100644
+index e00d567..f27aa76 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -2105,6 +2105,7 @@ version = "0.16.21"
+@@ -2126,6 +2126,7 @@ version = "0.16.27"
  dependencies = [
   "ahash",
   "argon2 0.6.0",
@@ -67,11 +86,31 @@ index d963d6c..78c173d 100644
   "base64 0.23.1",
   "deadpool",
   "jsonwebtoken",
+diff --git a/crates/common/src/auth/authentication.rs b/crates/common/src/auth/authentication.rs
+index 1ce0829..24b01f4 100644
+--- a/crates/common/src/auth/authentication.rs
++++ b/crates/common/src/auth/authentication.rs
+@@ -551,10 +551,13 @@ impl Server {
+         // SPDX-License-Identifier: LicenseRef-SEL
+         #[cfg(feature = "enterprise")]
+         if self.core.is_enterprise_edition() {
++            // The configured issuer, which discovery requires the provider's document to
++            // match: an undiscovered directory still claims its own tokens, and rejects them as
++            // unavailable rather than handing them to the default directory.
+             let mut matches = self.core.storage.directories.values().filter(|directory| {
+                 directory
+-                    .oidc_discovery_document()
+-                    .is_some_and(|discovery| discovery.document.issuer == issuer)
++                    .oidc_issuer_url()
++                    .is_some_and(|url| url.trim_end_matches('/') == issuer.trim_end_matches('/'))
+             });
+ 
+             return match (matches.next(), matches.next()) {
 diff --git a/crates/common/src/network/dns/records.rs b/crates/common/src/network/dns/records.rs
-index a2bba74..e38f6d8 100644
+index 221ae15..1173519 100644
 --- a/crates/common/src/network/dns/records.rs
 +++ b/crates/common/src/network/dns/records.rs
-@@ -390,8 +390,8 @@ impl Server {
+@@ -389,8 +389,8 @@ impl Server {
                  directory
                      .and_then(|directory| {
                          directory
@@ -83,7 +122,7 @@ index a2bba74..e38f6d8 100644
                      .unwrap_or_else(|| {
                          self.core
 diff --git a/crates/directory/Cargo.toml b/crates/directory/Cargo.toml
-index 643dc3b..8f1c238 100644
+index 2f6e678..17c39cd 100644
 --- a/crates/directory/Cargo.toml
 +++ b/crates/directory/Cargo.toml
 @@ -31,6 +31,7 @@ jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
@@ -95,25 +134,29 @@ index 643dc3b..8f1c238 100644
  [features]
  test_mode = []
 diff --git a/crates/directory/src/backend/oidc/config.rs b/crates/directory/src/backend/oidc/config.rs
-index 0ed926f..5619c92 100644
+index 5fdadb1..423f622 100644
 --- a/crates/directory/src/backend/oidc/config.rs
 +++ b/crates/directory/src/backend/oidc/config.rs
-@@ -7,12 +7,20 @@
+@@ -7,18 +7,21 @@
  use crate::Directory;
  use crate::backend::oidc::lookup::fetch_jwks_keys;
  use crate::backend::oidc::{
--    DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError, OpenIdDirectory,
-+    Discovered, DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError,
+-    CachedKey, DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError, OpenIdDirectory,
++    CachedKey, Discovered, DiscoveryDocument, JwksCache, OidcConfig, OidcDiscovery, OidcError,
 +    OpenIdDirectory, RetryState,
  };
+ use ahash::AHashMap;
  use registry::schema::structs;
-+use std::sync::OnceLock;
+-use std::sync::Arc;
++use std::sync::{Arc, OnceLock};
  use std::time::{Duration, Instant};
 -use tokio::sync::RwLock;
 +use tokio::sync::{Mutex, RwLock};
  use trc::AuthEvent;
-+use utils::Client;
-+
+ use utils::Client;
+ 
+-const DISCOVERY_RETRY_FOR: Duration = Duration::from_secs(30);
+-const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 +/// How long a directory waits before retrying a failed discovery: the first retry after
 +/// DISCOVERY_RETRY_MIN, then twice as long each time, up to DISCOVERY_RETRY_MAX.
 +const DISCOVERY_RETRY_MIN: Duration = Duration::from_secs(10);
@@ -121,18 +164,19 @@ index 0ed926f..5619c92 100644
  
  impl OpenIdDirectory {
      pub async fn open(config: structs::OidcDirectory) -> Result<Directory, String> {
-@@ -30,115 +38,217 @@ impl OpenIdDirectory {
+@@ -36,44 +39,150 @@ impl OpenIdDirectory {
          .map_err(|err| err.to_string())
      }
  
 +    /// Builds the directory, whether or not its identity provider can be reached now.
 +    ///
-+    /// Discovery is attempted at once, so a reachable provider is ready before the first token.
-+    /// When it fails (the provider is down, or starts after this server), the directory is
-+    /// built undiscovered rather than not at all: a directory that is missing is never retried,
-+    /// and its tokens fall through to the internal token decoder until a restart. Undiscovered,
-+    /// it rejects every token and retries discovery on use. Only a local failure (the HTTP
-+    /// client cannot be built) is an error here.
++    /// Discovery is attempted once, at once, so a reachable provider is ready before the first
++    /// token. When it fails (the provider is down, or starts after this server), the directory
++    /// is built undiscovered rather than not at all, and without waiting: a directory that is
++    /// not built is never retried, and a registry reload rebuilds the directories, so a wait
++    /// here would hold up the server's start and such a reload for as long as the provider is
++    /// down. Undiscovered, the directory rejects every token and retries discovery on use.
++    /// Only a local failure (the HTTP client cannot be built) is an error here.
      pub async fn new(config: OidcConfig) -> Result<Self, OidcError> {
 +        Self::with_retry(config, DISCOVERY_RETRY_MIN, DISCOVERY_RETRY_MAX).await
 +    }
@@ -147,30 +191,6 @@ index 0ed926f..5619c92 100644
              .timeout(Duration::from_secs(30))
              .build()
              .map_err(|e| OidcError::Network(format!("HTTP client build failed: {e}")))?;
--        let discovery_url = format!(
--            "{}/.well-known/openid-configuration",
--            config.issue_url.trim_end_matches('/')
--        );
--        let discovery_bytes = http
--            .get(&discovery_url)
--            .send()
--            .await
--            .map_err(|e| OidcError::Network(format!("Discovery fetch failed: {e}")))?
--            .error_for_status()
--            .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?
--            .bytes()
--            .await
--            .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?;
--        let discovery: DiscoveryDocument = serde_json::from_slice(&discovery_bytes)
--            .map_err(|e| OidcError::Provider(format!("Discovery JSON parse error: {e}")))?;
--
--        let normalised_issue = config.issue_url.trim_end_matches('/');
--        let normalised_issuer = discovery.issuer.trim_end_matches('/');
--        if normalised_issuer != normalised_issue {
--            return Err(OidcError::Provider(format!(
--                "Issuer mismatch: discovery document says '{}' but configured issue_url is '{}'",
--                discovery.issuer, config.issue_url,
--            )));
 +        let directory = Self {
 +            config,
 +            http,
@@ -200,11 +220,8 @@ index 0ed926f..5619c92 100644
 +    pub(crate) async fn discovered(&self) -> Result<&Discovered, OidcError> {
 +        if let Some(discovered) = self.discovered.get() {
 +            return Ok(discovered);
-         }
- 
--        if let Some(supported) = &discovery.scopes_supported {
--            for scope in &config.require_scopes {
--                if !supported.contains(scope) {
++        }
++
 +        // One attempt at a time. A caller that arrives while one is in flight does not wait for
 +        // it, since a provider that does not answer would hold it for the whole HTTP timeout: it
 +        // is rejected, as every caller is until discovery succeeds. Within the backoff nobody
@@ -228,17 +245,22 @@ index 0ed926f..5619c92 100644
 +                )));
 +            }
 +        }
-+
+ 
+-        let started_at = Instant::now();
+-        let (document, keys) = loop {
+-            match Self::discover(&http, &config).await {
+-                Ok(discovery) => break discovery,
+-                Err(err) if err.is_transient() && started_at.elapsed() < DISCOVERY_RETRY_FOR => {
 +        let started = Instant::now();
-+        match discover(&self.http, &self.config).await {
-+            Ok(discovered) => {
++        match Self::discover(&self.http, &self.config).await {
++            Ok((document, keys)) => {
 +                if retry.failures > 0 {
                      trc::event!(
 -                        Auth(AuthEvent::Warning),
 -                        Url = config.issue_url.to_string(),
 -                        Reason = format!(
--                            "Required scope '{}' is not in scopes_supported from the IdP",
--                            scope
+-                            "{err}, retrying in {} seconds",
+-                            DISCOVERY_RETRY_INTERVAL.as_secs()
 -                        )
 +                        Resource(trc::ResourceEvent::DownloadExternal),
 +                        Url = self.config.issue_url.to_string(),
@@ -246,16 +268,27 @@ index 0ed926f..5619c92 100644
 +                        Total = retry.failures,
 +                        Elapsed = started.elapsed(),
                      );
+-                    tokio::time::sleep(DISCOVERY_RETRY_INTERVAL).await;
                  }
+-                Err(err) => return Err(err),
 +                *retry = RetryState {
 +                    next_attempt: None,
 +                    delay: self.retry_min,
 +                    failures: 0,
 +                    last_error: String::new(),
 +                };
-+                Ok(self.discovered.get_or_init(|| discovered))
++                Ok(self.discovered.get_or_init(|| Discovered {
++                    discovery: OidcDiscovery {
++                        url: self.config.issue_url.clone(),
++                        document,
++                    },
++                    cache: RwLock::new(JwksCache {
++                        keys,
++                        last_updated: Instant::now(),
++                    }),
++                }))
              }
--        }
+-        };
 +            Err(err) => {
 +                let delay = if retry.failures == 0 {
 +                    self.retry_min
@@ -267,168 +300,49 @@ index 0ed926f..5619c92 100644
 +                retry.next_attempt = Some(Instant::now() + delay);
 +                retry.last_error = err.to_string();
  
--        if let Some(supported) = &discovery.claims_supported {
--            let check = |name: &str, label: &str| {
--                if !supported.iter().any(|c| c == name) {
+-        Ok(Self {
+-            discovery: OidcDiscovery {
+-                url: config.issue_url.clone(),
+-                document,
+-            },
+-            config,
+-            http,
+-            cache: RwLock::new(JwksCache {
+-                keys,
+-                last_updated: Instant::now(),
+-            }),
+-        })
 +                let reason = format!(
 +                    "OIDC discovery failed (attempt {}), so every token for this directory is rejected until it succeeds; next attempt in {}s: {err}",
 +                    retry.failures,
 +                    delay.as_secs()
 +                );
-+                // A provider that answers with a document for another issuer is misconfigured,
-+                // not down: it is still retried (the provider may be mid-deployment, and fixing
-+                // it must not need a restart here), but it is logged as an error.
-+                if matches!(err, OidcError::Configuration(_)) {
++                // A provider that cannot be reached, or answers with an error, is down. One that
++                // answers with a document for another issuer is misconfigured: it is still
++                // retried (the provider may be mid-deployment, and fixing it must not need a
++                // restart here), but it is logged as an error.
++                if err.is_transient() {
++                    trc::event!(
++                        Auth(AuthEvent::Warning),
++                        Url = self.config.issue_url.to_string(),
++                        Reason = reason,
++                    );
++                } else {
 +                    trc::event!(
 +                        Auth(AuthEvent::Error),
 +                        Url = self.config.issue_url.to_string(),
 +                        Reason = reason,
 +                    );
-+                } else {
-                     trc::event!(
-                         Auth(AuthEvent::Warning),
--                        Url = config.issue_url.to_string(),
--                        Reason = format!(
--                            "Configured {} claim '{}' is not in claims_supported from the IdP",
--                            label, name
--                        )
-+                        Url = self.config.issue_url.to_string(),
-+                        Reason = reason,
-                     );
-                 }
--            };
--            check(&config.claim_email, "claim_email");
--            if let Some(n) = &config.claim_name {
--                check(n, "claim_name");
--            }
--            if let Some(g) = &config.claim_groups {
--                check(g, "claim_groups");
++                }
 +
 +                Err(OidcError::Unavailable(retry.last_error.clone()))
-             }
-         }
-+    }
-+}
- 
--        /*{
--            let cache = Arc::clone(&cache);
--            let http = http.clone();
--            let jwks_uri = discovery.jwks_uri.clone();
--            tokio::spawn(async move {
--                let mut interval = tokio::time::interval(Duration::from_secs(24 * 3600));
--                interval.tick().await;
--                loop {
--                    interval.tick().await;
--                    match fetch_jwks_keys(&http, &jwks_uri).await {
--                        Ok(new_keys) => {
--                            let mut guard = cache.write().await;
--                            guard.keys = new_keys;
--                            guard.last_updated = Instant::now();
--                        }
--                        Err(e) => {
--                            trc::event!(
--                                Auth(AuthEvent::Warning),
--                                Url = jwks_uri.to_string(),
--                                Reason = format!("Background JWKS refresh failed: {e}")
--                            );
--                        }
--                    }
--                }
--            });
--        }*/
-+/// Fetches and checks the discovery document, then the JWKS it names.
-+async fn discover(http: &Client, config: &OidcConfig) -> Result<Discovered, OidcError> {
-+    let discovery_url = format!(
-+        "{}/.well-known/openid-configuration",
-+        config.issue_url.trim_end_matches('/')
-+    );
-+    let discovery_bytes = http
-+        .get(&discovery_url)
-+        .send()
-+        .await
-+        .map_err(|e| OidcError::Network(format!("Discovery fetch failed: {e}")))?
-+        .error_for_status()
-+        .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?
-+        .bytes()
-+        .await
-+        .map_err(|e| OidcError::Provider(format!("Discovery HTTP error: {e}")))?;
-+    let discovery: DiscoveryDocument = serde_json::from_slice(&discovery_bytes)
-+        .map_err(|e| OidcError::Provider(format!("Discovery JSON parse error: {e}")))?;
- 
--        let cache = RwLock::new(JwksCache {
--            keys: fetch_jwks_keys(&http, &discovery.jwks_uri).await?,
--            last_updated: Instant::now(),
--        });
-+    let normalised_issue = config.issue_url.trim_end_matches('/');
-+    let normalised_issuer = discovery.issuer.trim_end_matches('/');
-+    if normalised_issuer != normalised_issue {
-+        return Err(OidcError::Configuration(format!(
-+            "Issuer mismatch: discovery document says '{}' but configured issue_url is '{}'",
-+            discovery.issuer, config.issue_url,
-+        )));
-+    }
- 
--        Ok(Self {
--            discovery: OidcDiscovery {
--                url: config.issue_url.clone(),
--                document: discovery,
--            },
--            config,
--            http,
--            cache,
--        })
-+    if let Some(supported) = &discovery.scopes_supported {
-+        for scope in &config.require_scopes {
-+            if !supported.contains(scope) {
-+                trc::event!(
-+                    Auth(AuthEvent::Warning),
-+                    Url = config.issue_url.to_string(),
-+                    Reason = format!(
-+                        "Required scope '{}' is not in scopes_supported from the IdP",
-+                        scope
-+                    )
-+                );
 +            }
-+        }
-+    }
-+
-+    if let Some(supported) = &discovery.claims_supported {
-+        let check = |name: &str, label: &str| {
-+            if !supported.iter().any(|c| c == name) {
-+                trc::event!(
-+                    Auth(AuthEvent::Warning),
-+                    Url = config.issue_url.to_string(),
-+                    Reason = format!(
-+                        "Configured {} claim '{}' is not in claims_supported from the IdP",
-+                        label, name
-+                    )
-+                );
-+            }
-+        };
-+        check(&config.claim_email, "claim_email");
-+        if let Some(n) = &config.claim_name {
-+            check(n, "claim_name");
-+        }
-+        if let Some(g) = &config.claim_groups {
-+            check(g, "claim_groups");
 +        }
      }
-+
-+    let keys = fetch_jwks_keys(http, &discovery.jwks_uri).await?;
-+
-+    Ok(Discovered {
-+        discovery: OidcDiscovery {
-+            url: config.issue_url.clone(),
-+            document: discovery,
-+        },
-+        cache: RwLock::new(JwksCache {
-+            keys,
-+            last_updated: Instant::now(),
-+        }),
-+    })
- }
+ 
+     async fn discover(
 diff --git a/crates/directory/src/backend/oidc/lookup.rs b/crates/directory/src/backend/oidc/lookup.rs
-index 91ff6cb..1dfe080 100644
+index 64d9012..42addd4 100644
 --- a/crates/directory/src/backend/oidc/lookup.rs
 +++ b/crates/directory/src/backend/oidc/lookup.rs
 @@ -6,7 +6,7 @@
@@ -499,16 +413,16 @@ index 91ff6cb..1dfe080 100644
              validation.leeway = 60;
  
              match decode::<serde_json::Value>(token, dk, &validation) {
-@@ -88,7 +101,7 @@ impl OpenIdDirectory {
+@@ -90,7 +103,7 @@ impl OpenIdDirectory {
                              || is_claim_missing(&claims, self.config.claim_groups.as_ref());
  
-                     if jwt_email.is_none() || missing_profile {
+                     if jwt_email.is_none() || missing_username || missing_profile {
 -                        match self.fetch_userinfo(token).await {
 +                        match self.fetch_userinfo(discovered, token).await {
                              Ok(userinfo) => {
                                  if let (Some(base), Value::Object(extra)) =
                                      (claims.as_object_mut(), userinfo)
-@@ -123,14 +136,22 @@ impl OpenIdDirectory {
+@@ -125,14 +138,22 @@ impl OpenIdDirectory {
          )))
      }
  
@@ -535,7 +449,7 @@ index 91ff6cb..1dfe080 100644
  
              if let Some(kid) = kid {
                  if let Some(cached) = guard.keys.get(kid) {
-@@ -148,14 +169,14 @@ impl OpenIdDirectory {
+@@ -150,14 +171,14 @@ impl OpenIdDirectory {
              }
          }
  
@@ -553,7 +467,7 @@ index 91ff6cb..1dfe080 100644
          if let Some(kid) = kid {
              if let Some(cached) = guard.keys.get(kid) {
                  Ok(vec![cached.clone()])
-@@ -176,10 +197,14 @@ impl OpenIdDirectory {
+@@ -178,10 +199,14 @@ impl OpenIdDirectory {
          }
      }
  
@@ -571,7 +485,7 @@ index 91ff6cb..1dfe080 100644
              .send()
              .await
 diff --git a/crates/directory/src/backend/oidc/mod.rs b/crates/directory/src/backend/oidc/mod.rs
-index 03ad48c..403e54a 100644
+index 0ddb931..27aa3b9 100644
 --- a/crates/directory/src/backend/oidc/mod.rs
 +++ b/crates/directory/src/backend/oidc/mod.rs
 @@ -7,12 +7,18 @@
@@ -631,30 +545,28 @@ index 03ad48c..403e54a 100644
  }
  
  #[derive(Debug)]
-@@ -69,6 +97,8 @@ pub enum OidcError {
-     AuthorizationFailed(String),
+@@ -70,6 +98,7 @@ pub enum OidcError {
      Network(String),
      Provider(String),
-+    Configuration(String),
+     Config(String),
 +    Unavailable(String),
  }
  
- impl fmt::Display for OidcError {
-@@ -78,6 +108,8 @@ impl fmt::Display for OidcError {
-             OidcError::AuthorizationFailed(msg) => write!(f, "Authorization failed: {msg}"),
+ impl OidcError {
+@@ -86,6 +115,7 @@ impl fmt::Display for OidcError {
              OidcError::Network(msg) => write!(f, "Network error: {msg}"),
              OidcError::Provider(msg) => write!(f, "Provider error: {msg}"),
-+            OidcError::Configuration(msg) => write!(f, "Configuration error: {msg}"),
+             OidcError::Config(msg) => write!(f, "Configuration error: {msg}"),
 +            OidcError::Unavailable(msg) => write!(f, "Identity provider unavailable: {msg}"),
          }
      }
  }
 diff --git a/crates/directory/src/backend/oidc/tests.rs b/crates/directory/src/backend/oidc/tests.rs
 new file mode 100644
-index 0000000..1a84843
+index 0000000..d696a5a
 --- /dev/null
 +++ b/crates/directory/src/backend/oidc/tests.rs
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,450 @@
 +/*
 + * SPDX-License-Identifier: AGPL-3.0-only
 + */
@@ -664,13 +576,14 @@ index 0000000..1a84843
 +//! that can be down (nothing listening), failing (503) or misconfigured (another issuer).
 +
 +use super::{OidcConfig, OpenIdDirectory};
-+use crate::{Credentials, Directory};
++use crate::{Credentials, Directory, UnavailableDirectory};
 +use aws_lc_rs::{
 +    rand::SystemRandom,
 +    rsa::{KeyPair, KeySize},
 +    signature::{KeyPair as _, RSA_PKCS1_SHA256},
 +};
 +use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++use registry::schema::enums::DirectoryType;
 +use serde_json::{Value, json};
 +use std::{
 +    net::SocketAddr,
@@ -1062,12 +975,54 @@ index 0000000..1a84843
 +        EMAIL
 +    );
 +}
++
++#[tokio::test]
++async fn a_directory_is_built_without_waiting_for_its_provider() {
++    // Upstream retries discovery for 30 seconds inside open(), which holds up the server's start
++    // and every registry reload while the provider is down. Here it is one attempt, and the
++    // directory is built undiscovered: nothing listening, and a provider answering 503.
++    let started = std::time::Instant::now();
++    let down = directory(&format!("http://{}", free_port())).await;
++    assert!(
++        started.elapsed() < Duration::from_secs(2),
++        "building waited {:?} for a provider that is down",
++        started.elapsed()
++    );
++    assert!(matches!(down.oidc_discovery_document().await, Some(Err(_))));
++
++    let addr = free_port();
++    let issuer = format!("http://{addr}");
++    let idp = MockIdp::start(addr, &issuer, jwks(&rsa_key(), "k1"), Mode::Unavailable).await;
++    let started = std::time::Instant::now();
++    let failing = directory(&issuer).await;
++    assert!(
++        started.elapsed() < Duration::from_secs(2),
++        "building waited {:?} for a failing provider",
++        started.elapsed()
++    );
++    assert_eq!(idp.requests(), 1, "one attempt when the directory is built");
++    assert!(matches!(
++        failing.oidc_discovery_document().await,
++        Some(Err(_))
++    ));
++}
++
++#[tokio::test]
++async fn an_oidc_directory_that_could_not_be_built_has_no_discovery_document() {
++    // Never this server's own metadata for a domain that signs in through an identity provider.
++    let oidc = Directory::Unavailable(UnavailableDirectory::new(DirectoryType::Oidc, "failed"));
++    assert!(matches!(oidc.oidc_discovery_document().await, Some(Err(_))));
++    assert_eq!(oidc.oidc_issuer_url(), None);
++
++    let ldap = Directory::Unavailable(UnavailableDirectory::new(DirectoryType::Ldap, "failed"));
++    assert!(ldap.oidc_discovery_document().await.is_none());
++}
 diff --git a/crates/directory/src/core/dispatch.rs b/crates/directory/src/core/dispatch.rs
-index 21e47cd..d76d179 100644
+index 8ecd887..bd8467c 100644
 --- a/crates/directory/src/core/dispatch.rs
 +++ b/crates/directory/src/core/dispatch.rs
-@@ -34,9 +34,25 @@ impl Directory {
-         !matches!(self, Directory::OpenId(_))
+@@ -45,9 +45,31 @@ impl Directory {
+         }
      }
  
 -    pub fn oidc_discovery_document(&self) -> Option<&OidcDiscovery> {
@@ -1081,7 +1036,8 @@ index 21e47cd..d76d179 100644
 +    }
 +
 +    /// An OIDC directory's discovery document, discovering it first when that has not
-+    /// succeeded yet. `Some(Err)` while the identity provider cannot be reached.
++    /// succeeded yet. `Some(Err)` while the identity provider cannot be reached, and for an
++    /// OIDC directory that could not be built at all.
 +    pub async fn oidc_discovery_document(&self) -> Option<trc::Result<&OidcDiscovery>> {
 +        match &self {
 +            Directory::OpenId(directory) => Some(
@@ -1091,6 +1047,11 @@ index 21e47cd..d76d179 100644
 +                    .map(|discovered| &discovered.discovery)
 +                    .map_err(|err| trc::AuthEvent::Error.into_err().reason(err)),
 +            ),
++            Directory::Unavailable(directory)
++                if directory.directory_type() == DirectoryType::Oidc =>
++            {
++                Some(Err(directory.error()))
++            }
              _ => None,
          }
      }

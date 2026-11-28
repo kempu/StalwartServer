@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 6d3587f399af16e16598ace87e6211dea2e1bf70 Mon Sep 17 00:00:00 2001
 From: Klemens Arro <1125090+kempu@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 14:00:00 +0200
-Subject: [PATCH] jmap: a person a calendar or address book is shared with
+Subject: [PATCH 7/7] jmap: a person a calendar or address book is shared with
  chooses its subscription, and a shared calendar starts unsubscribed
 
 A client decides from isSubscribed whether a collection someone shared
@@ -162,3 +162,4 @@ index f41f10b..7a99dc8 100644
                          SetError::forbidden()
 -- 
 2.52.0
+

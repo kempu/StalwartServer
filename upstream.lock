@@ -6,9 +6,9 @@
 # RELEASE names the image; bump its last number whenever patches/ changes.
 
 STALWART_REPO="https://github.com/stalwartlabs/stalwart.git"
-STALWART_TAG="v0.16.21"
-STALWART_COMMIT="e96200385781a6a9995a8b839ac27d6c75a983ee"
-RELEASE="v0.16.21-kempu.5"
+STALWART_TAG="v0.16.27"
+STALWART_COMMIT="aa47d8ef7bfba7200d3293198ac2592747b20e73"
+RELEASE="v0.16.27-kempu.1"
 
 # What the search index holds. Bump it whenever a patch (or an upstream update) changes what is
 # written to the index, and never otherwise: it is baked into the image as the label
@@ -18,10 +18,17 @@ RELEASE="v0.16.21-kempu.5"
 # the hasAttachment flag delivery stores with a message, and a reindex copies that stored flag.
 # 0005 and 0006 change authentication and what its errors log, not the index, and 0007 who may
 # change a shared collection's subscription and what a sharee's calendar subscription reads.
+# Still "1" over v0.16.27: v0.16.21..v0.16.27 does not touch the code that builds what is
+# indexed (crates/email/src/message/index, crates/store/src/search, the PostgreSQL search
+# backend), and 0001 and 0002 apply to it unchanged. Their search changes are to MySQL deletes
+# and the Meilisearch and task-queue retry paths, not to what is written. Of the dependencies,
+# mail-parser 0.11.9 adds a base64 function and rewrites the header base64 decoder without
+# changing what a well-formed message decodes to, and jieba-rs 0.10.4 changes how the internal
+# search engine cuts Chinese text; this build searches with PostgreSQL, which does not use it.
 SEARCH_INDEX_FORMAT="1"
 
 # Upstream's own image of that release, which the harness measures as the stock baseline.
-UPSTREAM_IMAGE="docker.io/stalwartlabs/stalwart:v0.16.21@sha256:93c574e52249c1ebf90061da2c4c0756a7b72abfcc1fec34506a03c2e38b5977"
+UPSTREAM_IMAGE="docker.io/stalwartlabs/stalwart:v0.16.27@sha256:c429b311c93db5606598abc1c68225a85a6953183848ae01bee9c6a98885836c"
 
 # Build and runtime images, pinned by digest. Upstream's own Dockerfile floats on :latest.
 CHEF_IMAGE="docker.io/lukemathwalker/cargo-chef:0.1.78-rust-1.97.1-slim-trixie@sha256:c7569b097797bc1f3d86a8b6f8a056dc336d05c6f57dd81eb0486948f986dccd"

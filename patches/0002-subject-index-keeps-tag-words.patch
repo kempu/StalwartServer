@@ -1,7 +1,7 @@
-From 4918a5406bd3d9d4e9032b674ad8533f6c7b7489 Mon Sep 17 00:00:00 2001
+From c5de1a1cda57eb9b8a41e9e72e9ac02aa26b80a7 Mon Sep 17 00:00:00 2001
 From: Klemens Arro <1125090+kempu@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 15:05:44 +0300
-Subject: [PATCH 2/2] email search: index the words of a leading subject tag
+Subject: [PATCH 2/7] email search: index the words of a leading subject tag
 
 The Subject field was indexed as thread_name(subject), which removes
 reply prefixes and leading [tags]. "[Ticket ID: 4711] Payment link" was
@@ -121,3 +121,6 @@ index a7ed9ae..851ec29 100644
 +        }
 +    }
 +}
+-- 
+2.52.0
+
